@@ -1,0 +1,52 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gaston-pr-reviewer",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-10",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "durable_objects": {
+    "bindings": [{ "name": "REVIEWER", "class_name": "Reviewer" }]
+  },
+
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Reviewer"] }
+  ],
+
+  "queues": {
+    "producers": [{ "binding": "REVIEW_QUEUE", "queue": "gaston-reviews" }],
+    "consumers": [
+      {
+        "queue": "gaston-reviews",
+        "max_batch_size": 1,
+        "max_batch_timeout": 5,
+        "max_retries": 3,
+        "dead_letter_queue": "gaston-reviews-dlq",
+        "max_concurrency": 3
+      }
+    ]
+  },
+
+  "vars": {
+    "REVIEW_MIN_CONFIDENCE": "0.82",
+    "REVIEW_MAX_FINDINGS": "8",
+    "REQUEST_CHANGES_ON": "blocker",
+    "REVIEW_MODEL": "deepseek/deepseek-v4-flash-0731",
+    "REVIEW_REASONING_EFFORT": "high",
+    "REVIEW_MAX_WALL_TIME_MS": "240000",
+    "REVIEW_MODEL_TIMEOUT_MS": "120000",
+    "REVIEW_MAX_MODEL_REQUESTS": "6",
+    "REVIEW_MAX_INPUT_TOKENS": "250000",
+    "REVIEW_MAX_OUTPUT_TOKENS": "48000",
+    "REVIEW_MAX_COST_USD": "0.20",
+    "REVIEWER_GENERATION": "13"
+  },
+
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 1 }
+  },
+
+  "limits": { "cpu_ms": 300000 }
+}

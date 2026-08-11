@@ -1,0 +1,10 @@
+node_modules/
+.wrangler/
+dist/
+coverage/
+*.log
+.env
+.dev.vars
+worker-configuration.d.ts
+.firecrawl/
+.private/

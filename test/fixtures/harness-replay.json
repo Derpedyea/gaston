@@ -1,0 +1,58 @@
+{
+  "gates": {
+    "minPrecision": 1,
+    "minRecall": 1,
+    "maxP95ModelRequests": 3,
+    "maxP95ToolCalls": 2,
+    "maxP95CostUsd": 0.01
+  },
+  "cases": [
+    {
+      "name": "clean response stays bounded",
+      "phase": "discovery",
+      "responses": [
+        { "body": { "choices": [{ "message": { "content": "{\"summary\":\"clean\",\"findings\":[]}" } }], "usage": { "prompt_tokens": 100, "completion_tokens": 20, "cost": 0.0001 } } }
+      ],
+      "tools": [],
+      "expected": { "mustFind": [], "mustNotFind": [], "maxModelRequests": 1, "maxToolCalls": 0, "maxCostUsd": 0.001 }
+    },
+    {
+      "name": "one evidence pass then finalization",
+      "phase": "discovery",
+      "responses": [
+        { "body": { "choices": [{ "message": { "content": null, "tool_calls": [{ "id": "read-1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"src/a.ts\",\"ref\":\"head\",\"start_line\":1,\"end_line\":20}" } }] } }] } },
+        { "body": { "choices": [{ "message": { "content": "{\"summary\":\"verified\",\"findings\":[{\"path\":\"src/a.ts\",\"line\":1,\"side\":\"RIGHT\",\"severity\":\"high\",\"title\":\"unguarded failure\",\"why\":\"A realistic call reaches the failing branch.\",\"evidence\":\"The changed line invokes the branch without a guard.\",\"suggestedFix\":\"Add the missing guard.\",\"confidence\":0.95}]}" } }], "usage": { "prompt_tokens": 220, "completion_tokens": 30, "cost": 0.0002 } } }
+      ],
+      "tools": [
+        { "name": "read_file", "status": "ok", "content": "1: export const safe = true;" }
+      ],
+      "expected": { "mustFind": ["src/a.ts:1:unguarded failure"], "mustNotFind": ["src/a.ts:2:false positive"], "maxModelRequests": 2, "maxToolCalls": 1, "maxCostUsd": 0.001 }
+    },
+    {
+      "name": "truncated evidence gets one targeted recovery",
+      "phase": "verification",
+      "responses": [
+        { "body": { "choices": [{ "message": { "content": null, "tool_calls": [{ "id": "wide", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"src/large.ts\",\"ref\":\"head\",\"start_line\":1,\"end_line\":400}" } }] } }] } },
+        { "body": { "choices": [{ "message": { "content": null, "tool_calls": [{ "id": "narrow", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"src/large.ts\",\"ref\":\"head\",\"start_line\":180,\"end_line\":220}" } }] } }] } },
+        { "body": { "choices": [{ "message": { "content": "{\"summary\":\"recovered\",\"findings\":[]}" } }], "usage": { "prompt_tokens": 350, "completion_tokens": 40, "cost": 0.0003 } } }
+      ],
+      "tools": [
+        { "name": "read_file", "status": "truncated", "content": "partial", "suggestedAction": "Read a narrower range." },
+        { "name": "read_file", "status": "ok", "content": "180: guarded();" }
+      ],
+      "expected": { "mustFind": [], "mustNotFind": [], "maxModelRequests": 3, "maxToolCalls": 2, "maxCostUsd": 0.001 }
+    },
+    {
+      "name": "structurally truncated tool JSON is repaired only on length finish",
+      "phase": "discovery",
+      "responses": [
+        { "body": { "choices": [{ "finish_reason": "length", "message": { "content": null, "tool_calls": [{ "id": "partial", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"src/a.ts\",\"ref\":\"head\",\"start_line\":1,\"end_line\":20" } }] } }] } },
+        { "body": { "choices": [{ "message": { "content": "{\"summary\":\"safe repair\",\"findings\":[]}" } }] } }
+      ],
+      "tools": [
+        { "name": "read_file", "status": "ok", "content": "1: safe();" }
+      ],
+      "expected": { "mustFind": [], "mustNotFind": [], "maxModelRequests": 2, "maxToolCalls": 1, "maxCostUsd": 0.001 }
+    }
+  ]
+}

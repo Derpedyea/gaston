@@ -1,0 +1,35 @@
+{
+  "name": "gaston-pr-reviewer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "High-precision, budget-bounded GitHub PR reviews with DeepSeek V4 Flash and a Cloudflare Computer-backed agent harness.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler types && tsc --noEmit && vitest run && bun run check:privacy && bun run eval:historical && bun run eval:harness",
+    "check:privacy": "bun tools/check-public-tree.ts",
+    "diagnose:pr": "bun tools/diagnose-pr.mjs",
+    "eval:harness": "bun tools/run-harness-eval.ts",
+    "eval:historical": "bun tools/validate-historical-corpus.ts",
+    "fixtures:capture": "bun tools/capture-historical-prs.ts",
+    "test": "vitest run",
+    "types:generate": "wrangler types",
+    "types:check": "wrangler types --check",
+    "pretypecheck": "wrangler types",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cloudflare/computer": "0.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "26.2.0",
+    "typescript": "6.0.3",
+    "vitest": "4.1.10",
+    "wrangler": "4.120.1"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "packageManager": "bun@1.3.14"
+}
