@@ -292,10 +292,6 @@ export class RepositoryTools {
     return this.#coverage.snapshot();
   }
 
-  recordHarnessResult(name: string, result: EvidenceResult): void {
-    this.#coverage.record(name, result);
-  }
-
   async invoke(name: string, rawArguments: string, signal?: AbortSignal): Promise<EvidenceResult> {
     throwIfAborted(signal);
     const key = `${name}:${canonicalArguments(rawArguments)}`;

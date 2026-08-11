@@ -40,7 +40,6 @@ export interface EvidenceCoverage {
 export interface EvidenceTools {
   invoke(name: string, rawArguments: string, signal?: AbortSignal): Promise<EvidenceResult>;
   coverage?(): EvidenceCoverage;
-  recordHarnessResult?(name: string, result: EvidenceResult): void;
 }
 
 interface CoverageOptions {

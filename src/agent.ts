@@ -204,6 +204,9 @@ export class ReviewAgent {
           }
 
           if (scheduledThisBatch >= maxCallsThisBatch || executedToolCalls >= MAX_TOOL_CALLS_PER_PHASE) {
+            // This is a harness control message, not a failed repository
+            // lookup. Keep it in the model transcript without contaminating
+            // evidence coverage or the operator-facing tool-error count.
             const result: EvidenceResult = {
               status: "permanent_error",
               content: "Tool-call safety budget reached. Use the evidence already returned and finalize the review.",
@@ -212,7 +215,6 @@ export class ReviewAgent {
               suggestedAction: "Finalize from existing evidence and omit anything unproved.",
               isError: true,
             };
-            tools.recordHarnessResult?.(call.function.name, result);
             return {
               content: renderEvidenceResult(result),
               result,

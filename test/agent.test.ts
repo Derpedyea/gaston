@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ReviewAgent } from "../src/agent.ts";
 import { ReviewBudget } from "../src/budget.ts";
+import { EvidenceCoverageTracker, type EvidenceResult } from "../src/evidence.ts";
 import type { RepositoryTools } from "../src/repository.ts";
 
 const TEST_API_KEY = `sk-or-v1-${"x".repeat(64)}`;
@@ -663,7 +664,6 @@ describe("ReviewAgent", () => {
     }));
 
     const invoke = vi.fn(async () => ({ content: "evidence" }));
-    const recordHarnessResult = vi.fn();
     const agent = new ReviewAgent({
       apiKey: TEST_API_KEY,
       model: "deepseek/deepseek-v4-flash-0731",
@@ -671,13 +671,94 @@ describe("ReviewAgent", () => {
       repository: "owner/repo",
     });
 
-    await expect(agent.run("review", { invoke, recordHarnessResult } as unknown as RepositoryTools, "verification"))
+    await expect(agent.run("review", { invoke } as unknown as RepositoryTools, "verification"))
       .resolves.toEqual({ summary: "bounded batch", findings: [] });
     expect(invoke).toHaveBeenCalledTimes(4);
-    expect(recordHarnessResult).toHaveBeenCalledTimes(16);
     const secondMessages = bodies[1]!.messages as Array<{ role: string; content?: string }>;
     expect(secondMessages.filter((message) => message.role === "tool")).toHaveLength(20);
     expect(secondMessages.filter((message) => message.content?.includes("safety budget reached"))).toHaveLength(16);
+  });
+
+  it("does not report the harness tool cap as unavailable repository evidence", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      bodies.push(body);
+      if (body.tools === undefined) {
+        return jsonResponse({ choices: [{ message: { content: '{"summary":"bounded","findings":[]}' } }] });
+      }
+      if (bodies.length === 1) {
+        return jsonResponse({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [
+                toolCall("broad-read", "read_file", '{"path":"src/a.ts","ref":"head","start_line":1,"end_line":400}'),
+                toolCall("exact-patch", "diff_for_file", '{"path":"src/a.ts"}'),
+                toolCall("initial-search", "search_code", '{"query":"caller"}'),
+              ],
+            },
+          }],
+        });
+      }
+      return jsonResponse({
+        choices: [{
+          message: {
+            content: null,
+            tool_calls: [
+              toolCall("narrow-read", "read_file", '{"path":"src/a.ts","ref":"head","start_line":100,"end_line":150}'),
+              toolCall("recovery-search", "search_code", '{"query":"guard"}'),
+              toolCall("over-cap-search", "search_code", '{"query":"extra"}'),
+            ],
+          },
+        }],
+      });
+    }));
+
+    const tracker = new EvidenceCoverageTracker({ totalChangedFiles: 6, initialDiffTruncated: false });
+    const invoke = vi.fn(async (name: string, rawArguments: string): Promise<EvidenceResult> => {
+      const args = JSON.parse(rawArguments) as Record<string, unknown>;
+      const broadRead = name === "read_file" && args.start_line === 1;
+      const result: EvidenceResult = broadRead
+        ? {
+            status: "truncated",
+            content: "partial evidence",
+            retryable: false,
+            evidence: { scope: "read_file:head:src/a.ts", complete: false },
+            suggestedAction: "Request a narrower line range once.",
+          }
+        : {
+            status: "ok",
+            content: "complete evidence",
+            retryable: false,
+            evidence: {
+              scope: name === "read_file" ? "read_file:head:src/a.ts" : `${name}:${String(args.query ?? args.path ?? "")}`,
+              complete: true,
+            },
+          };
+      tracker.record(name, result, name === "diff_for_file" ? "src/a.ts" : undefined);
+      return result;
+    });
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    await expect(agent.run("review", {
+      invoke,
+    }, "discovery")).resolves.toEqual({ summary: "bounded", findings: [] });
+
+    expect(tracker.snapshot()).toMatchObject({
+      sufficient: true,
+      totalChangedFiles: 6,
+      inspectedChangedFiles: 1,
+      toolCalls: 5,
+      truncatedResults: 1,
+      permanentErrors: 0,
+      limitations: [],
+    });
   });
 
   it("compacts old tool results before the carried context exceeds 150 KB", async () => {
@@ -724,4 +805,8 @@ function jsonResponse(value: unknown, status = 200): Response {
     status,
     headers: { "content-type": "application/json" },
   });
+}
+
+function toolCall(id: string, name: string, args: string) {
+  return { id, type: "function", function: { name, arguments: args } };
 }
