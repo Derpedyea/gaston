@@ -204,8 +204,9 @@ tool result is bounded. Discovery has one normal evidence turn, a four-call
 tool cap, and a tool-disabled finalization turn. A truncated result or invalid
 tool payload can unlock exactly one focused two-call recovery turn. Verification runs only when discovery
 returns a changed-line candidate. Every phase and retry shares the default
-four-minute, six-request, 250,000 estimated-input-token, 48,000 output-token,
-and $0.20 reported-cost budget. Prompts are capped at 72 KB, individual tool
+fourteen-minute, nine-request, 250,000 estimated-input-token, 128,000 output-token,
+and $0.20 reported-cost budget. The active resource ledger survives queue
+redelivery without counting queue backoff as work. Prompts are capped at 72 KB, individual tool
 results at 12 KB with visible head/tail previews, and history is compacted
 toward 120 KB. Completed analysis is checkpointed so publishing retries do not restart inference. Keep
 OpenRouter's independent per-key spend limit enabled as defense in depth.
@@ -217,10 +218,15 @@ Tune `wrangler.jsonc` only after observing real reviews:
 - Raise `REVIEW_MIN_CONFIDENCE` to reduce noise.
 - Keep `REVIEW_REASONING_EFFORT=high`; Gaston rejects lower values so every
   discovery, verification, finalization, repair, and retry uses high reasoning.
+- Review `REVIEW_MODEL_MAX_OUTPUT_TOKENS` whenever `REVIEW_MODEL` changes; it is
+  a per-request policy ceiling, not automatic model-capability discovery.
+- Keep the `:exacto` variant when tool-call reliability matters more than
+  throughput-first routing; an explicit OpenRouter provider sort overrides it.
 - Lower `REVIEW_MAX_COST_USD` or `REVIEW_MAX_MODEL_REQUESTS` to tighten the
   aggregate review budget.
-- Raise `REVIEW_MAX_WALL_TIME_MS` only after checking the check-run resource
-  summary and structured `agent.model_response` logs.
+- Do not raise `REVIEW_MAX_WALL_TIME_MS` above fourteen minutes in this Queue
+  deployment; Cloudflare caps a consumer invocation at fifteen minutes, and
+  Gaston reserves the final minute for setup, publication, and acknowledgement.
 - Keep `REQUEST_CHANGES_ON` at `blocker` until the team trusts the bot.
 - Add `.gaston/review.md` on the default branch for repository invariants.
 

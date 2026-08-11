@@ -18,7 +18,7 @@ Gaston automatically reviews pull requests with a custom TypeScript agent
 harness running entirely on Cloudflare Workers. It uses
 [Cloudflare Computer](https://github.com/cloudflare/computer) as a durable
 SQLite-backed workspace and calls
-[`deepseek/deepseek-v4-flash-0731`](https://openrouter.ai/deepseek/deepseek-v4-flash-0731)
+[`deepseek/deepseek-v4-flash-0731:exacto`](https://openrouter.ai/deepseek/deepseek-v4-flash-0731)
 through OpenRouter.
 
 There are no containers, Docker images, shells, or dynamically executed PRs.
@@ -72,7 +72,9 @@ across tool calls. Exact reads are memoized, prompts are capped at 72 KB, tool
 results retain marked head/tail previews, and history is compacted to a 120 KB
 carried-context target. Immutable trees and files are cached by commit SHA
 across new PR heads, while per-run context is cleared independently.
-A shared four-minute/request/token/cost budget covers every phase and retry.
+A shared fourteen-minute/request/token/cost budget covers every phase, provider
+attempt, and queue redelivery. Resource usage is persisted before provider work
+leaves the Durable Object; queue backoff does not count as active review time.
 Deterministic code then drops weak findings, invalid line anchors, stale-head
 results, and anything over the configured finding cap.
 
@@ -86,8 +88,8 @@ Durable Object restart cannot make an older execution current again.
 Every accepted head gets a queued check immediately. If a newer commit arrives,
 Gaston aborts the older head's model request, retry delay, and in-flight GitHub
 evidence reads, marks that check superseded, and reviews the full cumulative PR
-diff at the new head. Transient queue failures reuse the same check; exhausted
-deliveries are retained in a dead-letter queue.
+diff at the new head. Transient queue failures reuse the same check and remaining
+budget; exhausted deliveries are retained in a dead-letter queue.
 
 ## Quick start
 
@@ -121,16 +123,17 @@ permissions, installation, verification, and troubleshooting.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `REVIEW_MODEL` | `deepseek/deepseek-v4-flash-0731` | Exact OpenRouter model |
+| `REVIEW_MODEL` | `deepseek/deepseek-v4-flash-0731:exacto` | OpenRouter model and tool-quality-first routing variant |
 | `REVIEW_REASONING_EFFORT` | `high` | Fixed review effort; Gaston rejects lower values rather than silently downgrading reasoning |
+| `REVIEW_MODEL_MAX_OUTPUT_TOKENS` | `64000` | Per-attempt completion ceiling; normal requests start at 32,000 and a true length exhaustion can use this ceiling |
 | `REVIEW_MIN_CONFIDENCE` | `0.82` | Minimum confidence for published findings |
 | `REVIEW_MAX_FINDINGS` | `8` | Maximum inline findings per review |
 | `REQUEST_CHANGES_ON` | `blocker` | `off`, `blocker`, or `high` |
-| `REVIEW_MAX_WALL_TIME_MS` | `240000` | Aggregate review wall-clock limit |
-| `REVIEW_MODEL_TIMEOUT_MS` | `120000` | Timeout for one provider attempt |
-| `REVIEW_MAX_MODEL_REQUESTS` | `6` | Aggregate provider-attempt limit |
+| `REVIEW_MAX_WALL_TIME_MS` | `840000` | Aggregate active-review wall-clock limit; queue backoff is excluded |
+| `REVIEW_MODEL_TIMEOUT_MS` | `660000` | Timeout for one provider attempt |
+| `REVIEW_MAX_MODEL_REQUESTS` | `9` | Aggregate provider-attempt limit |
 | `REVIEW_MAX_INPUT_TOKENS` | `250000` | Approximate aggregate input-token limit |
-| `REVIEW_MAX_OUTPUT_TOKENS` | `48000` | Reported aggregate output-token limit |
+| `REVIEW_MAX_OUTPUT_TOKENS` | `128000` | Reported aggregate output-token limit |
 | `REVIEW_MAX_COST_USD` | `0.20` | Reported aggregate OpenRouter cost limit |
 
 Add repository-specific guidance in `.gaston/review.md`. Gaston also reuses
@@ -193,8 +196,10 @@ snapshot is tracked, providing a second guard beyond `.gitignore`.
 
 The research behind the low-noise review strategy is documented in
 [docs/research.md](docs/research.md); the exhaustive competitor review is in
-[docs/deep-research.md](docs/deep-research.md), and the OpenCode V2 harness
-investigation is in [docs/harness-research.md](docs/harness-research.md).
+[docs/deep-research.md](docs/deep-research.md), the historical OpenCode harness
+investigation is in [docs/harness-research.md](docs/harness-research.md), and
+the current OpenCode V2/DeepSeek reliability follow-up is in
+[docs/harness-v2-research.md](docs/harness-v2-research.md).
 
 ## Current limitations
 

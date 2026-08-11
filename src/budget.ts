@@ -29,13 +29,15 @@ export interface ReportedModelUsage {
 }
 
 export const DEFAULT_REVIEW_BUDGET: ReviewBudgetLimits = {
-  maxWallTimeMs: 4 * 60_000,
-  maxModelRequests: 6,
+  maxWallTimeMs: 14 * 60_000,
+  maxModelRequests: 9,
   maxEstimatedInputTokens: 250_000,
-  maxOutputTokens: 48_000,
+  maxOutputTokens: 128_000,
   maxCostUsd: 0.20,
-  modelRequestTimeoutMs: 120_000,
+  modelRequestTimeoutMs: 11 * 60_000,
 };
+
+type BudgetSnapshotObserver = (snapshot: ReviewBudgetSnapshot) => void;
 
 export class ReviewBudgetExceededError extends Error {
   readonly reason: string;
@@ -61,11 +63,44 @@ export class ReviewBudget {
   #reasoningTokens = 0;
   #costUsd = 0;
   #exhaustedReason: string | undefined;
+  readonly #onSnapshot: BudgetSnapshotObserver | undefined;
 
-  constructor(limits: ReviewBudgetLimits = DEFAULT_REVIEW_BUDGET, now = Date.now()) {
+  constructor(
+    limits: ReviewBudgetLimits = DEFAULT_REVIEW_BUDGET,
+    now = Date.now(),
+    onSnapshot?: BudgetSnapshotObserver,
+    restoredElapsedMs = 0,
+  ) {
     this.limits = limits;
-    this.#startedAt = now;
-    this.signal = AbortSignal.timeout(limits.maxWallTimeMs);
+    const elapsedMs = Math.min(limits.maxWallTimeMs, nonNegative(restoredElapsedMs));
+    this.#startedAt = now - elapsedMs;
+    this.#onSnapshot = onSnapshot;
+    this.signal = AbortSignal.timeout(Math.max(1, limits.maxWallTimeMs - elapsedMs));
+  }
+
+  static resume(
+    limits: ReviewBudgetLimits,
+    previous: ReviewBudgetSnapshot,
+    now = Date.now(),
+    onSnapshot?: BudgetSnapshotObserver,
+  ): ReviewBudget {
+    const elapsedMs = Math.min(limits.maxWallTimeMs, nonNegative(previous.elapsedMs));
+    const budget = new ReviewBudget(limits, now, onSnapshot, elapsedMs);
+    budget.#modelRequests = Math.floor(nonNegative(previous.modelRequests));
+    budget.#estimatedInputTokens = Math.floor(nonNegative(previous.estimatedInputTokens));
+    budget.#reportedInputTokens = Math.floor(nonNegative(previous.reportedInputTokens));
+    budget.#outputTokens = Math.floor(nonNegative(previous.outputTokens));
+    budget.#cachedTokens = Math.floor(nonNegative(previous.cachedTokens));
+    budget.#reasoningTokens = Math.floor(nonNegative(previous.reasoningTokens));
+    budget.#costUsd = nonNegative(previous.costUsd);
+    if (budget.#reportedInputTokens > limits.maxEstimatedInputTokens) {
+      budget.#exhaustedReason = "reported input-token limit";
+    } else if (budget.#outputTokens > limits.maxOutputTokens) {
+      budget.#exhaustedReason = "reported output-token limit";
+    } else if (budget.#costUsd > limits.maxCostUsd) {
+      budget.#exhaustedReason = "reported cost limit";
+    }
+    return budget;
   }
 
   reserveModelRequest(requestBytes: number, maxOutputTokens: number): ReviewBudgetSnapshot {
@@ -86,7 +121,7 @@ export class ReviewBudget {
 
     this.#modelRequests++;
     this.#estimatedInputTokens += estimatedInputTokens;
-    return this.snapshot();
+    return this.#publishSnapshot();
   }
 
   recordUsage(usage: ReportedModelUsage): ReviewBudgetSnapshot {
@@ -102,7 +137,7 @@ export class ReviewBudget {
     } else if (this.#costUsd > this.limits.maxCostUsd) {
       this.#exhaustedReason = "reported cost limit";
     }
-    return this.snapshot();
+    return this.#publishSnapshot();
   }
 
   throwIfExceeded(): void {
@@ -112,9 +147,9 @@ export class ReviewBudget {
     }
   }
 
-  shouldWrapUp(): boolean {
+  shouldWrapUp(reservedModelRequests = 2): boolean {
     const snapshot = this.snapshot();
-    return snapshot.remainingModelRequests <= 2
+    return snapshot.remainingModelRequests <= Math.max(0, reservedModelRequests)
       || snapshot.remainingWallTimeMs <= this.limits.maxWallTimeMs * 0.35
       || snapshot.estimatedInputTokens >= this.limits.maxEstimatedInputTokens * 0.75
       || snapshot.outputTokens >= this.limits.maxOutputTokens * 0.75
@@ -142,6 +177,12 @@ export class ReviewBudget {
 
   #error(reason: string): ReviewBudgetExceededError {
     return new ReviewBudgetExceededError(reason, this.snapshot());
+  }
+
+  #publishSnapshot(): ReviewBudgetSnapshot {
+    const snapshot = this.snapshot();
+    this.#onSnapshot?.(snapshot);
+    return snapshot;
   }
 }
 

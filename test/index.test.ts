@@ -13,14 +13,24 @@ describe("queue retry classification", () => {
     ))).toBe(false);
   });
 
-  it("retries rate limits, provider failures, and unexpected worker errors", () => {
+  it("retries rate limits, provider failures, and transport errors", () => {
     expect(shouldRetryReviewError(new Error(
       "OpenRouter discovery:state request failed (429): rate limited",
     ))).toBe(true);
     expect(shouldRetryReviewError(new Error(
       "OpenRouter verification completion failed (502): provider unavailable",
     ))).toBe(true);
-    expect(shouldRetryReviewError(new Error("GitHub request failed"))).toBe(true);
+    expect(shouldRetryReviewError(new TypeError("Network connection lost"))).toBe(true);
+    expect(shouldRetryReviewError(new Error(
+      "Retryable review dependency failure: OpenRouter discovery request failed after 3 attempts",
+    ))).toBe(true);
+  });
+
+  it("does not mislabel deterministic harness failures as transient dependencies", () => {
+    expect(shouldRetryReviewError(new Error(
+      "OpenRouter repeatedly returned invalid review JSON: findings must be an array",
+    ))).toBe(false);
+    expect(shouldRetryReviewError(new Error("unexpected invariant violation"))).toBe(false);
   });
 
   it("does not retry permanent GitHub API responses", () => {

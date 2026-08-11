@@ -7,7 +7,7 @@ import {
   withWorkspace,
 } from "@cloudflare/computer";
 
-import { ReviewAgent } from "./agent.ts";
+import { DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST, ReviewAgent } from "./agent.ts";
 import type { EvidenceCoverage } from "./evidence.ts";
 import {
   DEFAULT_REVIEW_BUDGET,
@@ -23,7 +23,7 @@ import { errorMessage, logError, logInfo } from "./log.ts";
 import { discoveryPrompt, REVIEW_LENS, verificationPrompt } from "./prompts.ts";
 import { filterFindings, parseChangedLines } from "./review-core.ts";
 import { RepositoryTools, RepositoryWorkspace } from "./repository.ts";
-import { shouldRetryReviewError } from "./retry.ts";
+import { RetryableReviewError, shouldRetryReviewError } from "./retry.ts";
 import type { Env, Finding, ReviewJob, ReviewOutcome, ReviewOutput } from "./types.ts";
 
 export { WorkspaceProxy };
@@ -160,7 +160,23 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
   ): Promise<ReviewOutcome> {
     const key = completionKey(job);
     const { github, checkRunId } = prepared;
-    const budget = new ReviewBudget(reviewBudgetLimits(this.env));
+    const budgetStorageKey = budgetKey(job);
+    const limits = reviewBudgetLimits(this.env);
+    const previousBudget = await this.ctx.storage.get<ReviewBudgetSnapshot>(budgetStorageKey);
+    const persistBudget = (snapshot: ReviewBudgetSnapshot) => {
+      const write = this.ctx.storage.put(budgetStorageKey, snapshot);
+      this.ctx.waitUntil(write);
+    };
+    const budget = previousBudget === undefined
+      ? new ReviewBudget(limits, Date.now(), persistBudget)
+      : ReviewBudget.resume(limits, previousBudget, Date.now(), persistBudget);
+    let preserveBudgetForRetry = false;
+    if (previousBudget !== undefined) {
+      logInfo("review.budget_resumed", {
+        ...reviewLogFields(job),
+        ...budget.snapshot(),
+      });
+    }
     try {
       if (signal.aborted || !(await this.#coordinator.isCurrent(lease.runKey, lease.generation))) {
         return await this.#finishSuperseded(job, github, checkRunId, "start", lease);
@@ -233,7 +249,10 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       if (isReviewBudgetExceededError(error)) {
         return await this.#finishBudgetExhausted(job, github, checkRunId, error.snapshot, error.reason, lease);
       }
-      if (shouldRetryReviewError(error) && (job.queueAttempt ?? 1) <= 3) {
+      const retryable = shouldRetryReviewError(error);
+      if (retryable && (job.queueAttempt ?? 1) <= 3) {
+        preserveBudgetForRetry = true;
+        await this.ctx.storage.put(budgetStorageKey, budget.snapshot());
         await github.updateCheckProgress(
           job,
           checkRunId,
@@ -247,11 +266,20 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
           error: errorMessage(error),
         });
         await this.#coordinator.markPhase(lease.runKey, lease.generation, "interrupted", checkRunId);
-        throw error;
+        throw new RetryableReviewError(error);
       }
       await github.failCheck(job, checkRunId, error).catch(() => undefined);
       logError("review.failed", { ...reviewLogFields(job), checkRunId, error: errorMessage(error) });
-      throw error;
+      throw retryable ? new RetryableReviewError(error) : error;
+    } finally {
+      if (!preserveBudgetForRetry) {
+        await this.ctx.storage.delete(budgetStorageKey).catch((error) => {
+          logError("review.budget_cleanup_failed", {
+            ...reviewLogFields(job),
+            error: errorMessage(error),
+          });
+        });
+      }
     }
   }
 
@@ -323,11 +351,17 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     const policy = await repository.reviewPolicy(signal);
     const agent = new ReviewAgent({
       apiKey: this.env.OPENROUTER_API_KEY,
-      model: this.env.REVIEW_MODEL ?? "deepseek/deepseek-v4-flash-0731",
+      model: this.env.REVIEW_MODEL ?? "deepseek/deepseek-v4-flash-0731:exacto",
       reasoningEffort: this.env.REVIEW_REASONING_EFFORT ?? "high",
       repository: `${job.owner}/${job.repo}`,
       signal,
       budget,
+      maxOutputTokensPerRequest: Math.round(boundedNumber(
+        this.env.REVIEW_MODEL_MAX_OUTPUT_TOKENS,
+        DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
+        2_000,
+        384_000,
+      )),
     });
     const tools = new RepositoryTools(repository);
 
@@ -442,6 +476,10 @@ function analysisKey(job: ReviewJob): string {
   return `analysis:${job.baseSha}:${job.headSha}:${executionScope(job)}`;
 }
 
+function budgetKey(job: ReviewJob): string {
+  return `budget:${job.baseSha}:${job.headSha}:${executionScope(job)}`;
+}
+
 function lensCheckpointKey(job: ReviewJob, lens: string): string {
   return `lens:${job.baseSha}:full:${job.headSha}:${executionScope(job)}:${lens}`;
 }
@@ -457,12 +495,14 @@ function boundedNumber(value: string | undefined, fallback: number, min: number,
 
 function reviewBudgetLimits(env: Env) {
   return {
-    maxWallTimeMs: boundedNumber(env.REVIEW_MAX_WALL_TIME_MS, DEFAULT_REVIEW_BUDGET.maxWallTimeMs, 30_000, 15 * 60_000),
+    // Queue consumers have a 15-minute platform wall; retain one minute for
+    // setup, publication, and acknowledgement outside the active review budget.
+    maxWallTimeMs: boundedNumber(env.REVIEW_MAX_WALL_TIME_MS, DEFAULT_REVIEW_BUDGET.maxWallTimeMs, 30_000, 14 * 60_000),
     maxModelRequests: Math.round(boundedNumber(env.REVIEW_MAX_MODEL_REQUESTS, DEFAULT_REVIEW_BUDGET.maxModelRequests, 2, 30)),
     maxEstimatedInputTokens: Math.round(boundedNumber(env.REVIEW_MAX_INPUT_TOKENS, DEFAULT_REVIEW_BUDGET.maxEstimatedInputTokens, 10_000, 2_000_000)),
     maxOutputTokens: Math.round(boundedNumber(env.REVIEW_MAX_OUTPUT_TOKENS, DEFAULT_REVIEW_BUDGET.maxOutputTokens, 2_000, 200_000)),
     maxCostUsd: boundedNumber(env.REVIEW_MAX_COST_USD, DEFAULT_REVIEW_BUDGET.maxCostUsd, 0.001, 100),
-    modelRequestTimeoutMs: boundedNumber(env.REVIEW_MODEL_TIMEOUT_MS, DEFAULT_REVIEW_BUDGET.modelRequestTimeoutMs, 5_000, 4 * 60_000),
+    modelRequestTimeoutMs: boundedNumber(env.REVIEW_MODEL_TIMEOUT_MS, DEFAULT_REVIEW_BUDGET.modelRequestTimeoutMs, 5_000, 12 * 60_000),
   };
 }
 

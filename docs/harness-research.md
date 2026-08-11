@@ -1,5 +1,10 @@
 # Exhaustive research: a bounded DeepSeek harness for Gaston
 
+> Historical design record. The current OpenCode V2, model-limit, retry, and
+> production wall-clock follow-up is in
+> [`harness-v2-research.md`](harness-v2-research.md); numeric defaults below
+> describe the earlier harness.
+
 Research completed 2026-08-11. This report was prompted by failed and slow
 reviews observed in a private production repository. Repository-specific
 identifiers and timing details have been removed from this public-safe report.

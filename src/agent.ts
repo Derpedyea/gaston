@@ -5,15 +5,15 @@ import { ReviewBudget, type ReviewBudgetSnapshot } from "./budget.ts";
 import { errorMessage, logError, logInfo, logWarn } from "./log.ts";
 
 const OPENROUTER_API = "https://openrouter.ai/api/v1/chat/completions";
-const MAX_OPENROUTER_ATTEMPTS = 2;
+const MAX_OPENROUTER_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 30_000;
 const MAX_EXPLORATION_TURNS = 2;
 const MAX_TOOL_CALLS_PER_BATCH = 4;
 const MAX_RECOVERY_TOOL_CALLS = 2;
 const MAX_TOOL_CALLS_PER_PHASE = MAX_TOOL_CALLS_PER_BATCH + MAX_RECOVERY_TOOL_CALLS;
 const MAX_CARRIED_CONTEXT_BYTES = 120_000;
-const INITIAL_OUTPUT_TOKEN_LIMIT = 8_000;
-const RETRY_OUTPUT_TOKEN_LIMIT = 16_000;
+const INITIAL_OUTPUT_TOKEN_LIMIT = 32_000;
+export const DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST = 64_000;
 
 type Message =
   | { role: "system" | "user"; content: string }
@@ -63,6 +63,13 @@ interface ChatResponse {
   provider?: string;
   choices?: ChatChoice[];
   error?: ChatError;
+  openrouter_metadata?: {
+    strategy?: string;
+    region?: string;
+    summary?: string;
+    attempt?: number;
+    endpoints?: { total?: number; available?: unknown[] };
+  };
   usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
@@ -82,6 +89,16 @@ interface RunDiagnostics {
   cost: number;
 }
 
+class OpenRouterDependencyError extends Error {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "OpenRouterDependencyError";
+    this.retryable = retryable;
+  }
+}
+
 export interface AgentOptions {
   apiKey: string;
   model: string;
@@ -90,10 +107,14 @@ export interface AgentOptions {
   signal?: AbortSignal;
   budget?: ReviewBudget;
   modelFetch?: typeof fetch;
+  maxOutputTokensPerRequest?: number;
 }
 
 export class ReviewAgent {
-  readonly #options: AgentOptions & { budget: ReviewBudget };
+  readonly #options: AgentOptions & {
+    budget: ReviewBudget;
+    maxOutputTokensPerRequest: number;
+  };
 
   constructor(options: AgentOptions) {
     const apiKey = options.apiKey.trim();
@@ -106,7 +127,17 @@ export class ReviewAgent {
     if (options.reasoningEffort.trim().toLowerCase() !== "high") {
       throw new Error("REVIEW_REASONING_EFFORT must be high; Gaston does not downgrade review reasoning");
     }
-    this.#options = { ...options, apiKey, budget: options.budget ?? new ReviewBudget() };
+    const maxOutputTokensPerRequest = options.maxOutputTokensPerRequest
+      ?? DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST;
+    if (!Number.isFinite(maxOutputTokensPerRequest) || maxOutputTokensPerRequest < 1) {
+      throw new Error("maxOutputTokensPerRequest must be a positive finite number");
+    }
+    this.#options = {
+      ...options,
+      apiKey,
+      budget: options.budget ?? new ReviewBudget(),
+      maxOutputTokensPerRequest: Math.trunc(maxOutputTokensPerRequest),
+    };
   }
 
   async run(prompt: string, tools: EvidenceTools, phase: string): Promise<ReviewOutput> {
@@ -245,7 +276,10 @@ export class ReviewAgent {
           explorationTurns === 1
           && recoveryNeeded
           && !outcomes.some((outcome) => outcome.budgetLimited)
-          && !this.#options.budget.shouldWrapUp()
+          // A recovery turn and the final JSON are each logical requests with
+          // up to three physical provider attempts. Do not spend the capacity
+          // needed to finish on optional evidence recovery.
+          && !this.#options.budget.shouldWrapUp(MAX_OPENROUTER_ATTEMPTS * 2)
         ) {
           messages.push({
             role: "user",
@@ -261,7 +295,7 @@ export class ReviewAgent {
 
         const finalizationReason = outcomes.some((outcome) => outcome.budgetLimited)
           ? "The tool-call safety budget was reached."
-          : this.#options.budget.shouldWrapUp()
+          : this.#options.budget.shouldWrapUp(MAX_OPENROUTER_ATTEMPTS)
             ? "The review resource budget is nearing its limit."
             : explorationTurns >= MAX_EXPLORATION_TURNS || !recoveryNeeded
               ? explorationTurns >= MAX_EXPLORATION_TURNS
@@ -367,8 +401,11 @@ export class ReviewAgent {
       model: this.#options.model,
       messages: prepared.messages,
       session_id: sessionId,
-      max_tokens: INITIAL_OUTPUT_TOKEN_LIMIT,
-      provider: { allow_fallbacks: true, require_parameters: true, sort: "throughput" },
+      max_tokens: Math.min(
+        INITIAL_OUTPUT_TOKEN_LIMIT,
+        this.#options.maxOutputTokensPerRequest,
+      ),
+      provider: { allow_fallbacks: true, require_parameters: true },
       reasoning: { effort: "high" },
     };
     // OpenCode's provider transform leaves temperature unset for DeepSeek, and
@@ -428,7 +465,7 @@ export class ReviewAgent {
             authorization: `Bearer ${this.#options.apiKey}`,
             "content-type": "application/json",
             "http-referer": `https://github.com/${this.#options.repository}`,
-            "x-openrouter-metadata": "enabled",
+            "x-openrouter-experimental-metadata": "enabled",
             "x-title": "Gaston PR Reviewer",
           },
           body: serializedBody,
@@ -449,9 +486,10 @@ export class ReviewAgent {
           );
           continue;
         }
-        throw new Error(
+        throw new OpenRouterDependencyError(
           `OpenRouter ${phase} request failed after ${MAX_OPENROUTER_ATTEMPTS} attempts: ${errorMessage(error)}`,
-          { cause: error },
+          true,
+          error,
         );
       }
 
@@ -460,7 +498,7 @@ export class ReviewAgent {
         parsed = JSON.parse(raw) as ChatResponse;
       } catch {
         const emptyUpstreamRejection = !response.ok && raw.trim() === "";
-        if ((isRetryableStatus(response.status) || emptyUpstreamRejection) && attempt < MAX_OPENROUTER_ATTEMPTS) {
+        if ((response.ok || isRetryableStatus(response.status) || emptyUpstreamRejection) && attempt < MAX_OPENROUTER_ATTEMPTS) {
           if (emptyUpstreamRejection) relaxCompatibilityConstraint(body);
           await waitBeforeRetry(
             phase,
@@ -472,7 +510,10 @@ export class ReviewAgent {
           );
           continue;
         }
-        throw new Error(`OpenRouter ${phase} returned invalid JSON (${response.status}): ${raw.slice(0, 1_000)}`);
+        throw new OpenRouterDependencyError(
+          `OpenRouter ${phase} returned invalid JSON (${response.status}): ${raw.slice(0, 1_000)}`,
+          response.ok || isRetryableStatus(response.status),
+        );
       }
 
       const usage = recordResponseUsage(parsed, diagnostics, this.#options.budget);
@@ -490,6 +531,12 @@ export class ReviewAgent {
         apiErrorType: parsed.error?.metadata?.error_type,
         choiceErrorCode: parsed.choices?.[0]?.error?.code,
         choiceErrorType: parsed.choices?.[0]?.error?.metadata?.error_type,
+        routerStrategy: parsed.openrouter_metadata?.strategy,
+        routerRegion: parsed.openrouter_metadata?.region,
+        routerSummary: parsed.openrouter_metadata?.summary,
+        routerAttempt: parsed.openrouter_metadata?.attempt,
+        routerEndpointCount: parsed.openrouter_metadata?.endpoints?.total,
+        routerAvailableEndpoints: parsed.openrouter_metadata?.endpoints?.available?.length,
         promptTokens: usage.promptTokens,
         completionTokens: usage.completionTokens,
         requestCachedTokens: usage.cachedTokens,
@@ -502,6 +549,7 @@ export class ReviewAgent {
         const status = typeof parsed.error?.code === "number" ? parsed.error.code : response.status;
         const detail = parsed.error?.message ?? raw.slice(0, 1_000);
         if (isRetryableOpenRouterError(status, parsed.error?.metadata?.error_type) && attempt < MAX_OPENROUTER_ATTEMPTS) {
+          excludeProvider(body, parsed.provider);
           await waitBeforeRetry(
             phase,
             diagnostics.turn,
@@ -512,7 +560,10 @@ export class ReviewAgent {
           );
           continue;
         }
-        throw new Error(`OpenRouter ${phase} request failed (${status}): ${detail}`);
+        throw new OpenRouterDependencyError(
+          `OpenRouter ${phase} request failed (${status}): ${detail}`,
+          isRetryableOpenRouterError(status, parsed.error?.metadata?.error_type),
+        );
       }
 
       const choice = parsed.choices?.[0];
@@ -532,7 +583,10 @@ export class ReviewAgent {
           );
           continue;
         }
-        throw new Error(`OpenRouter ${phase} completion failed (${status}): ${detail}`);
+        throw new OpenRouterDependencyError(
+          `OpenRouter ${phase} completion failed (${status}): ${detail}`,
+          isRetryableOpenRouterError(status, choiceError.metadata?.error_type),
+        );
       }
 
       const message = choice?.message;
@@ -572,7 +626,9 @@ export class ReviewAgent {
         const detail = emptyCompletionDetail(choice, parsed, body);
         if (attempt < MAX_OPENROUTER_ATTEMPTS) {
           excludeProvider(body, parsed.provider);
-          if (outputBudgetExhausted(choice, parsed, body)) increaseOutputTokenLimit(body);
+          if (outputBudgetExhausted(choice, parsed, body)) {
+            increaseOutputTokenLimit(body, this.#options.maxOutputTokensPerRequest);
+          }
           await waitBeforeRetry(
             phase,
             diagnostics.turn,
@@ -583,7 +639,10 @@ export class ReviewAgent {
           );
           continue;
         }
-        throw new Error(`OpenRouter ${phase} returned an empty completion after ${MAX_OPENROUTER_ATTEMPTS} attempts (${detail})`);
+        throw new OpenRouterDependencyError(
+          `OpenRouter ${phase} returned an empty completion after ${MAX_OPENROUTER_ATTEMPTS} attempts (${detail})`,
+          true,
+        );
       }
       return {
         content,
@@ -653,9 +712,11 @@ function recordResponseUsage(
 
 function isRetryableOpenRouterError(status: number, errorType?: string): boolean {
   if (isRetryableStatus(status)) return true;
-  return errorType === "timeout"
+  return errorType === "rate_limit_exceeded"
+    || errorType === "timeout"
     || errorType === "provider_overloaded"
     || errorType === "provider_unavailable"
+    || errorType === "server"
     || errorType === "server_error";
 }
 
@@ -689,9 +750,9 @@ function outputBudgetExhausted(
   return maximum > 0 && (response.usage?.completion_tokens ?? 0) >= maximum;
 }
 
-function increaseOutputTokenLimit(body: Record<string, unknown>): void {
+function increaseOutputTokenLimit(body: Record<string, unknown>, maximum: number): void {
   const current = typeof body.max_tokens === "number" ? body.max_tokens : INITIAL_OUTPUT_TOKEN_LIMIT;
-  body.max_tokens = Math.max(current, RETRY_OUTPUT_TOKEN_LIMIT);
+  body.max_tokens = Math.min(maximum, Math.max(current, current * 2));
 }
 
 function emptyCompletionDetail(
@@ -764,7 +825,8 @@ function retryDelayMs(response: Response | undefined, attempt: number): number {
       : Date.parse(retryAfter) - Date.now();
     if (Number.isFinite(delay) && delay >= 0) return Math.min(delay, MAX_RETRY_DELAY_MS);
   }
-  return Math.min(250 * (4 ** (attempt - 1)), MAX_RETRY_DELAY_MS);
+  const ceiling = Math.min(1_000 * (2 ** Math.max(0, attempt - 1)), MAX_RETRY_DELAY_MS);
+  return Math.round((ceiling / 2) + (Math.random() * ceiling / 2));
 }
 
 function logPhaseCompleted(phase: string, diagnostics: RunDiagnostics, review: ReviewOutput): void {

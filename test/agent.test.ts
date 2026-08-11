@@ -87,8 +87,8 @@ describe("ReviewAgent", () => {
     expect(requests[0]!.parallel_tool_calls).toBeUndefined();
     expect(requests[0]!.reasoning).toEqual({ effort: "high" });
     expect(requests[1]!.reasoning).toEqual({ effort: "high" });
-    expect(requests[0]!.max_tokens).toBe(8_000);
-    expect(requests[1]!.max_tokens).toBe(8_000);
+    expect(requests[0]!.max_tokens).toBe(32_000);
+    expect(requests[1]!.max_tokens).toBe(32_000);
     expect(requests[0]!.temperature).toBeUndefined();
     expect(requests[0]!.session_id).toMatch(/^gaston:owner\/repo:discovery:/);
     expect(requests[1]!.session_id).toBe(requests[0]!.session_id);
@@ -135,8 +135,105 @@ describe("ReviewAgent", () => {
     expect(bodies[0]!.provider).toEqual({
       allow_fallbacks: true,
       require_parameters: true,
-      sort: "throughput",
     });
+  });
+
+  it("recovers when two consecutive provider transports fail transiently", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    const fetchMock = vi.fn(async () => {
+      attempts++;
+      if (attempts <= 2) throw new TypeError("Network connection lost.");
+      return jsonResponse({ choices: [{ message: { content: '{"summary":"recovered","findings":[]}' } }] });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    const review = agent.run("review", { invoke: vi.fn() } as unknown as RepositoryTools, "discovery");
+    const assertion = expect(review).resolves.toEqual({ summary: "recovered", findings: [] });
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("uses the configured per-request output allowance instead of an 8k hard cap", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const metadataHeaders: Array<string | null> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      metadataHeaders.push(new Headers(init?.headers).get("x-openrouter-experimental-metadata"));
+      return jsonResponse({ choices: [{ message: { content: '{"summary":"roomy","findings":[]}' } }] });
+    }));
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+      maxOutputTokensPerRequest: 32_000,
+    });
+
+    await expect(agent.run("review", { invoke: vi.fn() } as unknown as RepositoryTools, "discovery"))
+      .resolves.toEqual({ summary: "roomy", findings: [] });
+
+    expect(bodies[0]!.max_tokens).toBe(32_000);
+    expect(metadataHeaders).toEqual(["enabled"]);
+  });
+
+  it("retries a malformed successful provider response inside the request loop", async () => {
+    vi.useFakeTimers();
+    let attempts = 0;
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      attempts++;
+      return attempts === 1
+        ? new Response("upstream proxy returned HTML", { status: 200 })
+        : jsonResponse({ choices: [{ message: { content: '{"summary":"recovered","findings":[]}' } }] });
+    }));
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    const review = agent.run("review", { invoke: vi.fn() } as unknown as RepositoryTools, "discovery");
+    const assertion = expect(review).resolves.toEqual({ summary: "recovered", findings: [] });
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(attempts).toBe(2);
+  });
+
+  it("excludes a provider after a top-level typed availability error", async () => {
+    vi.useFakeTimers();
+    const bodies: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return bodies.length === 1
+        ? jsonResponse({
+          provider: "DeepInfra",
+          error: { code: 502, message: "unavailable", metadata: { error_type: "provider_unavailable" } },
+        }, 502)
+        : jsonResponse({ choices: [{ message: { content: '{"summary":"fallback","findings":[]}' } }] });
+    }));
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    const review = agent.run("review", { invoke: vi.fn() } as unknown as RepositoryTools, "discovery");
+    const assertion = expect(review).resolves.toEqual({ summary: "fallback", findings: [] });
+    await vi.runAllTimersAsync();
+    await assertion;
+
+    expect(bodies[1]!.provider).toMatchObject({ ignore: ["deepinfra"] });
   });
 
   it("aborts in-flight model work when a newer pull request head supersedes it", async () => {
@@ -258,12 +355,12 @@ describe("ReviewAgent", () => {
 
     const review = agent.run("review", { invoke: vi.fn() } as unknown as RepositoryTools, "verification");
     const assertion = expect(review).rejects.toThrow(
-      "OpenRouter verification request failed after 2 attempts: Network connection lost.",
+      "OpenRouter verification request failed after 3 attempts: Network connection lost.",
     );
     await vi.runAllTimersAsync();
     await assertion;
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("retries an output-exhausted completion with more headroom and high reasoning", async () => {
@@ -305,8 +402,8 @@ describe("ReviewAgent", () => {
     expect(bodies[1]!.provider).toMatchObject({ ignore: ["deepinfra"] });
     expect(bodies[0]!.reasoning).toEqual({ effort: "high" });
     expect(bodies[1]!.reasoning).toEqual({ effort: "high" });
-    expect(bodies[0]!.max_tokens).toBe(8_000);
-    expect(bodies[1]!.max_tokens).toBe(16_000);
+    expect(bodies[0]!.max_tokens).toBe(32_000);
+    expect(bodies[1]!.max_tokens).toBe(64_000);
   });
 
   it("expands finalization headroom without lowering reasoning", async () => {
@@ -329,7 +426,7 @@ describe("ReviewAgent", () => {
           }],
         });
       }
-      if (Number(body.max_tokens) > 8_000) {
+      if (Number(body.max_tokens) > 32_000) {
         return jsonResponse({
           choices: [{ message: { content: '{"summary":"finalized","findings":[]}' } }],
           usage: {
@@ -348,8 +445,8 @@ describe("ReviewAgent", () => {
         }],
         usage: {
           prompt_tokens: 17_078,
-          completion_tokens: 8_000,
-          completion_tokens_details: { reasoning_tokens: 8_000 },
+          completion_tokens: 32_000,
+          completion_tokens_details: { reasoning_tokens: 32_000 },
         },
       });
     }));
@@ -374,8 +471,8 @@ describe("ReviewAgent", () => {
     expect(bodies[2]!.tools).toBeUndefined();
     expect(bodies[1]!.reasoning).toEqual({ effort: "high" });
     expect(bodies[2]!.reasoning).toEqual({ effort: "high" });
-    expect(bodies[1]!.max_tokens).toBe(8_000);
-    expect(bodies[2]!.max_tokens).toBe(16_000);
+    expect(bodies[1]!.max_tokens).toBe(32_000);
+    expect(bodies[2]!.max_tokens).toBe(64_000);
   });
 
   it("accounts for usage reported by a failed provider attempt", async () => {

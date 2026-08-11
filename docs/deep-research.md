@@ -1,5 +1,9 @@
 # Exhaustive research: AI code-review systems and Gaston
 
+> Historical design record. Current OpenCode V2 and DeepSeek reliability
+> findings, including the revised token and wall-clock defaults, are in
+> [`harness-v2-research.md`](harness-v2-research.md).
+
 Research completed 2026-08-10. This report combines primary product
 documentation, open-source implementation patterns, production case studies,
 and recent automated-code-review research. Vendor claims are architecture
