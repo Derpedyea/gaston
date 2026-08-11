@@ -189,8 +189,11 @@ The deployed App configuration is independently self-auditing:
 curl -fsS https://gaston-pr-reviewer.<your-subdomain>.workers.dev/health/github
 ```
 
-Every requirement must be `true`; in particular, `issueCommentEvent` and
-`issuesWrite` are required for the comment trigger and its reaction. Worker lifecycle
+Every requirement must be `true`; in particular, `issueCommentEvent`,
+`issuesWrite`, and `installationsReady` are required for the comment trigger and
+its reaction. The installation check prevents an unapproved permission update
+from making the App registration look ready when installed copies still have
+their old grants. Worker lifecycle
 logs are structured by `deliveryId`, repository, PR number, head SHA, trigger,
 and outcome for direct filtering in Workers Logs or `wrangler tail`.
 

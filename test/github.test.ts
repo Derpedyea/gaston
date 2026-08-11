@@ -23,12 +23,19 @@ describe("getGitHubAppReadiness", () => {
     const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
     const pem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      expect(String(input)).toBe("https://api.github.com/app");
       expect(new Headers(init?.headers).get("authorization")).toMatch(/^Bearer [^.]+\.[^.]+\.[^.]+$/);
-      return new Response(JSON.stringify({
+      if (String(input) === "https://api.github.com/app") {
+        return new Response(JSON.stringify({
+          events: ["pull_request"],
+          permissions: { contents: "read", pull_requests: "write", checks: "write", issues: "write" },
+        }), { status: 200 });
+      }
+      expect(String(input)).toBe("https://api.github.com/app/installations?per_page=100");
+      return new Response(JSON.stringify([{
         events: ["pull_request"],
-        permissions: { contents: "read", pull_requests: "write", checks: "write", issues: "write" },
-      }), { status: 200 });
+        permissions: { contents: "read", pull_requests: "write", checks: "write" },
+        suspended_at: null,
+      }]), { status: 200 });
     });
     vi.stubGlobal("fetch", fetch);
 
@@ -41,7 +48,10 @@ describe("getGitHubAppReadiness", () => {
         pullRequestsWrite: true,
         checksWrite: true,
         issuesWrite: true,
+        installationsPresent: true,
+        installationsReady: false,
       },
+      installations: { total: 1, ready: 0 },
     });
   });
 });

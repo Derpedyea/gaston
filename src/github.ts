@@ -39,6 +39,12 @@ interface AuthenticatedGitHubApp {
   permissions?: Record<string, string>;
 }
 
+interface GitHubAppInstallation {
+  events?: string[];
+  permissions?: Record<string, string>;
+  suspended_at?: string | null;
+}
+
 export interface GitHubAppReadiness {
   ok: boolean;
   requirements: {
@@ -48,7 +54,10 @@ export interface GitHubAppReadiness {
     pullRequestsWrite: boolean;
     checksWrite: boolean;
     issuesWrite: boolean;
+    installationsPresent: boolean;
+    installationsReady: boolean;
   };
+  installations: { total: number; ready: number };
 }
 
 export interface PullRequestState {
@@ -468,9 +477,21 @@ export class GitHubClient {
 
 export async function getGitHubAppReadiness(appId: string, privateKey: string): Promise<GitHubAppReadiness> {
   const jwt = await createAppJwt(appId, privateKey);
-  const app = await githubRequest<AuthenticatedGitHubApp>("/app", jwt);
+  const [app, installations] = await Promise.all([
+    githubRequest<AuthenticatedGitHubApp>("/app", jwt),
+    githubRequest<GitHubAppInstallation[]>("/app/installations?per_page=100", jwt),
+  ]);
   const events = new Set(app.events ?? []);
   const permissions = app.permissions ?? {};
+  const readyInstallations = installations.filter((installation) => (
+    installation.suspended_at == null
+    && new Set(installation.events ?? []).has("pull_request")
+    && new Set(installation.events ?? []).has("issue_comment")
+    && hasPermission(installation.permissions?.contents, "read")
+    && hasPermission(installation.permissions?.pull_requests, "write")
+    && hasPermission(installation.permissions?.checks, "write")
+    && hasPermission(installation.permissions?.issues, "write")
+  ));
   const requirements = {
     pullRequestEvent: events.has("pull_request"),
     issueCommentEvent: events.has("issue_comment"),
@@ -478,8 +499,14 @@ export async function getGitHubAppReadiness(appId: string, privateKey: string): 
     pullRequestsWrite: hasPermission(permissions.pull_requests, "write"),
     checksWrite: hasPermission(permissions.checks, "write"),
     issuesWrite: hasPermission(permissions.issues, "write"),
+    installationsPresent: installations.length > 0,
+    installationsReady: installations.length > 0 && readyInstallations.length === installations.length,
   };
-  return { ok: Object.values(requirements).every(Boolean), requirements };
+  return {
+    ok: Object.values(requirements).every(Boolean),
+    requirements,
+    installations: { total: installations.length, ready: readyInstallations.length },
+  };
 }
 
 function hasPermission(actual: string | undefined, required: "read" | "write"): boolean {
