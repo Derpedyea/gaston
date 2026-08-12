@@ -95,6 +95,129 @@ describe("ReviewAgent", () => {
     expect(requests[1]!.session_id).toBe(requests[0]!.session_id);
   });
 
+  it("forces exact patch retrieval before accepting a final answer when the initial diff is truncated", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (requests.length === 1) {
+        return jsonResponse({ choices: [{ message: { content: '{"summary":"premature","findings":[]}' } }] });
+      }
+      if (requests.length === 2) {
+        return jsonResponse({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [
+                toolCall("patch-a", "diff_for_file", '{"path":"src/a.ts"}'),
+                toolCall("patch-b", "diff_for_file", '{"path":"src/b.ts"}'),
+              ],
+            },
+          }],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: '{"summary":"patches inspected","findings":[]}' } }] });
+    }));
+
+    const tracker = new EvidenceCoverageTracker({ totalChangedFiles: 21, initialDiffTruncated: true });
+    const invoke = vi.fn(async (name: string, rawArguments: string): Promise<EvidenceResult> => {
+      const path = String((JSON.parse(rawArguments) as { path: string }).path);
+      const result: EvidenceResult = {
+        status: "ok",
+        content: `exact patch for ${path}`,
+        retryable: false,
+        evidence: { scope: `diff_for_file:${path}`, complete: true },
+      };
+      tracker.record(name, result, path);
+      return result;
+    });
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    await expect(agent.run("review", {
+      invoke,
+      coverage: () => tracker.snapshot(),
+    }, "discovery")).resolves.toEqual({ summary: "patches inspected", findings: [] });
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(tracker.snapshot().inspectedChangedFiles).toBe(2);
+    expect(requests).toHaveLength(3);
+    expect(requests[1]!.tools).toBeDefined();
+    expect((requests[1]!.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name))
+      .toEqual(["diff_for_file"]);
+    const recoveryMessages = requests[1]!.messages as Array<{ role: string; content?: string }>;
+    expect(recoveryMessages.at(-1)?.content).toContain("no exact changed-file patch has been inspected");
+    expect(recoveryMessages.at(-1)?.content).toContain("Use diff_for_file now");
+  });
+
+  it("uses the recovery turn for patches when successful broad calls did not recover a truncated initial diff", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string, init?: RequestInit) => {
+      requests.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      if (requests.length === 1) {
+        return jsonResponse({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [
+                toolCall("files", "changed_files", "{}"),
+                toolCall("tree", "repository_tree", '{"prefix":"src"}'),
+                toolCall("search", "search_code", '{"query":"handler"}'),
+                toolCall("source", "read_file", '{"path":"src/a.ts","ref":"head","start_line":1,"end_line":40}'),
+              ],
+            },
+          }],
+        });
+      }
+      if (requests.length === 2) {
+        return jsonResponse({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [toolCall("patch", "diff_for_file", '{"path":"src/a.ts"}')],
+            },
+          }],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: '{"summary":"recovered","findings":[]}' } }] });
+    }));
+
+    const tracker = new EvidenceCoverageTracker({ totalChangedFiles: 21, initialDiffTruncated: true });
+    const invoke = vi.fn(async (name: string, rawArguments: string): Promise<EvidenceResult> => {
+      const args = JSON.parse(rawArguments) as { path?: string };
+      const result: EvidenceResult = {
+        status: "ok",
+        content: "complete evidence",
+        retryable: false,
+        evidence: { scope: `${name}:${args.path ?? "result"}`, complete: true },
+      };
+      tracker.record(name, result, name === "diff_for_file" ? args.path : undefined);
+      return result;
+    });
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    await expect(agent.run("review", {
+      invoke,
+      coverage: () => tracker.snapshot(),
+    }, "discovery")).resolves.toEqual({ summary: "recovered", findings: [] });
+
+    expect(invoke).toHaveBeenCalledTimes(5);
+    expect(tracker.snapshot().inspectedChangedFiles).toBe(1);
+    expect((requests[1]!.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name))
+      .toEqual(["diff_for_file"]);
+    const recoveryMessages = requests[1]!.messages as Array<{ content?: string }>;
+    expect(recoveryMessages.at(-1)?.content).toContain("must retrieve code changes");
+  });
+
   it("fails closed on an OpenRouter error", async () => {
     const fetchMock = vi.fn(async () => jsonResponse({ error: { message: "bad key" } }, 401));
     vi.stubGlobal("fetch", fetchMock);

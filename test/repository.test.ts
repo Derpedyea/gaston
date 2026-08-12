@@ -103,6 +103,51 @@ describe("RepositoryTools", () => {
     expect(new TextEncoder().encode(result.content).byteLength).toBeLessThanOrEqual(12_000);
   });
 
+  it("returns exact patch slices with actionable continuation metadata", async () => {
+    const patch = Array.from({ length: 450 }, (_, index) => `+changed line ${index + 1}`).join("\n");
+    const repository = new RepositoryWorkspace(
+      {} as never,
+      {} as never,
+      job(),
+      {
+        files: [{ path: "src/large.ts", status: "modified", additions: 450, deletions: 0, patch }],
+        diff: "",
+        truncated: false,
+      },
+    );
+    const tools = new RepositoryTools(repository);
+
+    const first = await tools.invoke("diff_for_file", '{"path":"src/large.ts"}');
+    expect(first).toMatchObject({
+      status: "truncated",
+      suggestedAction: expect.stringContaining("patch_start_line 201"),
+    });
+    expect(JSON.parse(first.content)).toMatchObject({
+      patchStartLine: 1,
+      patchEndLine: 200,
+      totalPatchLines: 450,
+      nextPatchStartLine: 201,
+    });
+
+    const recovered = await tools.invoke(
+      "diff_for_file",
+      '{"path":"src/large.ts","patch_start_line":201,"patch_end_line":260}',
+    );
+    expect(recovered.status).toBe("ok");
+    expect(JSON.parse(recovered.content)).toMatchObject({
+      patchStartLine: 201,
+      patchEndLine: 260,
+      hasMoreBefore: true,
+      hasMoreAfter: true,
+    });
+    expect(recovered.content).toContain("+changed line 201");
+    expect(tools.coverage()).toMatchObject({
+      sufficient: true,
+      inspectedChangedFiles: 1,
+      truncatedResults: 1,
+    });
+  });
+
   it("rejects immediately when a review signal is already aborted", async () => {
     const controller = new AbortController();
     controller.abort(new Error("superseded"));

@@ -62,11 +62,14 @@ request prevents duplicate reviews and supersedes stale in-flight work when a
 new head arrives. Computer caches the evidence the agent reads without cloning
 or executing the repository.
 
-The discovery agent can list changed files, inspect patches, list repository
+The discovery agent can list changed files, inspect bounded patch slices, list repository
 paths, read bounded file slices, and perform literal code searches. It receives
 one evidence turn with at most four parallel reads, then a tool-disabled final
 turn. Only a truncated or invalid tool result unlocks one targeted recovery
-turn with at most two calls. An independent verifier runs only when discovery produced candidates.
+turn with at most two calls. A truncated initial cumulative diff with no exact
+patch inspected also unlocks that recovery turn and directs it to the riskiest
+changed-file patches. Oversized per-file patches return patch-line continuation
+metadata for a narrower follow-up. An independent verifier runs only when discovery produced candidates.
 DeepSeek reasoning state—including meaningful empty reasoning—is preserved
 across tool calls. Exact reads are memoized, prompts are capped at 72 KB, tool
 results retain marked head/tail previews, and history is compacted to a 120 KB

@@ -91,7 +91,13 @@ export class EvidenceCoverageTracker {
     if (result.status === "ok" && result.evidence?.complete !== false) {
       this.#unresolved.delete(scope);
       if (tool === "read_file" && changedPath) this.#unresolved.delete(`diff_for_file:${changedPath}`);
-      if (tool === "diff_for_file" && changedPath) this.#inspectedChangedFiles.add(changedPath);
+      if (tool === "diff_for_file" && changedPath) {
+        // A bounded exact patch slice is the intended recovery for an
+        // oversized full-patch response. Resolve that earlier hazard while
+        // retaining the run-level initial-diff limitation.
+        this.#unresolved.delete(`diff_for_file:${changedPath}`);
+        this.#inspectedChangedFiles.add(changedPath);
+      }
       return;
     }
 

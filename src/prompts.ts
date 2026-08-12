@@ -67,6 +67,7 @@ Your discovery scope is ${lens.id}: concentrate on ${lens.focus}.
 
 Method:
 1. Inspect the riskiest changed files and the surrounding repository context.
+   If the initial diff or changed-file overview is truncated, retrieve exact code changes with diff_for_file before finalizing; do not substitute tree or search results for a patch.
 2. Trace callers, callees, schemas, state transitions, error paths, concurrency, auth boundaries, and relevant tests.
 3. For every candidate, actively search for guards, types, framework guarantees, or tests that disprove it.
 4. Report at most 12 candidates, only on actually changed lines. Use RIGHT for added lines and LEFT for deleted lines; use the new path for renames.

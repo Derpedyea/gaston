@@ -14,6 +14,7 @@ const RUN_ROOT = `${ROOT}/run`;
 const REF_CACHE_ROOT = `${ROOT}/cache/refs`;
 const MAX_FILE_BYTES = 400_000;
 const MAX_TOOL_RESULT_BYTES = 12_000;
+const DEFAULT_PATCH_LINES = 200;
 const MAX_CACHED_REFS = 12;
 const CACHE_TTL_MS = 14 * 24 * 60 * 60 * 1_000;
 const BASE_POLICY_FILES = [
@@ -81,17 +82,31 @@ export class RepositoryWorkspace {
     return JSON.stringify({ files, truncated: this.changes.truncated || this.changes.files.length > limit });
   }
 
-  diffForFile(path: string): string {
+  diffForFile(path: string, patchStartLine?: number, patchEndLine?: number): string {
     const normalized = safePath(path);
     const file = this.changes.files.find((entry) => entry.path === normalized || entry.previousPath === normalized);
     if (!file) throw new Error("path is not changed by this pull request");
     if (!file.patch) return JSON.stringify({ path: file.path, patch: null, reason: "GitHub omitted this binary or oversized patch" });
+
+    const lines = file.patch.split("\n");
+    const explicitlyRanged = patchStartLine !== undefined || patchEndLine !== undefined;
+    const startLine = Math.max(1, Math.min(Math.trunc(patchStartLine ?? 1), lines.length));
+    const endLine = Math.max(
+      startLine,
+      Math.min(Math.trunc(patchEndLine ?? startLine + DEFAULT_PATCH_LINES - 1), startLine + 399, lines.length),
+    );
     return JSON.stringify({
       path: file.path,
       previousPath: file.previousPath ?? null,
       status: file.status,
-      patch: file.patch.slice(0, 120_000),
-      truncated: file.patch.length > 120_000,
+      patchStartLine: startLine,
+      patchEndLine: endLine,
+      totalPatchLines: lines.length,
+      patch: lines.slice(startLine - 1, endLine).join("\n"),
+      truncated: !explicitlyRanged && endLine < lines.length,
+      hasMoreBefore: startLine > 1,
+      hasMoreAfter: endLine < lines.length,
+      ...(endLine < lines.length ? { nextPatchStartLine: endLine + 1 } : {}),
     });
   }
 
@@ -313,7 +328,11 @@ export class RepositoryTools {
           content = this.#repo.changedFiles(integer(args.limit, 300));
           break;
         case "diff_for_file":
-          content = this.#repo.diffForFile(requiredString(args.path, "path"));
+          content = this.#repo.diffForFile(
+            requiredString(args.path, "path"),
+            optionalInteger(args.patch_start_line),
+            optionalInteger(args.patch_end_line),
+          );
           break;
         case "repository_tree":
           content = await this.#repo.tree(optionalString(args.prefix) ?? "", integer(args.limit, 200), signal);
@@ -348,7 +367,8 @@ export class RepositoryTools {
             content: bounded.content,
             retryable: false,
             evidence: { ...inferredEvidence, complete: false },
-            suggestedAction: "Request a narrower line range or more specific query once.",
+            suggestedAction: inferred.suggestedAction
+              ?? "Request a narrower line range or more specific query once.",
           }
         : { ...inferred, content: bounded.content };
       this.#coverage.record(name, result, changedPath(name, args));
@@ -403,7 +423,7 @@ function inferEvidence(name: string, args: Record<string, unknown>, content: str
       retryable: false,
       evidence,
       suggestedAction: name === "diff_for_file"
-        ? "Read the exact head/base file around the changed lines before deciding."
+        ? diffRecoveryAction(args, parsed)
         : "Use a narrower prefix, range, or limit once to recover complete evidence.",
     };
   }
@@ -439,7 +459,13 @@ function numericCoverage(value: Record<string, unknown> | undefined): Pick<NonNu
 function evidenceScope(name: string, args: Record<string, unknown> | undefined): string {
   const path = typeof args?.path === "string" ? args.path.trim() : "";
   const ref = args?.ref === "base" ? "base" : "head";
-  if (name === "diff_for_file") return `${name}:${path}`;
+  if (name === "diff_for_file") {
+    const start = optionalInteger(args?.patch_start_line);
+    const end = optionalInteger(args?.patch_end_line);
+    return start === undefined && end === undefined
+      ? `${name}:${path}`
+      : `${name}:${path}:${start ?? 1}-${end ?? "default"}`;
+  }
   if (name === "read_file") return `${name}:${ref}:${path}`;
   if (name === "repository_tree") return `${name}:${typeof args?.prefix === "string" ? args.prefix.trim() : ""}`;
   if (name === "search_code") return `${name}:${typeof args?.query === "string" ? args.query.trim() : ""}`;
@@ -516,6 +542,22 @@ function optionalString(value: unknown): string | undefined {
 
 function integer(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isInteger(value) ? value : fallback;
+}
+
+function optionalInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) ? value : undefined;
+}
+
+function diffRecoveryAction(
+  args: Record<string, unknown>,
+  parsed: Record<string, unknown> | undefined,
+): string {
+  const path = typeof args.path === "string" ? args.path.trim() : "the changed file";
+  const nextStart = optionalInteger(parsed?.nextPatchStartLine);
+  if (nextStart !== undefined) {
+    return `Call diff_for_file again for ${path} with patch_start_line ${nextStart} and patch_end_line ${nextStart + DEFAULT_PATCH_LINES - 1}.`;
+  }
+  return "Read the exact head/base file around the visible changed hunk lines before deciding.";
 }
 
 async function fileExists(workspace: WorkspaceClient, path: string): Promise<boolean> {
