@@ -66,10 +66,13 @@ The discovery agent can list changed files, inspect bounded patch slices, list r
 paths, read bounded file slices, and perform literal code searches. It receives
 one evidence turn with at most four parallel reads, then a tool-disabled final
 turn. Only a truncated or invalid tool result unlocks one targeted recovery
-turn with at most two calls. A truncated initial cumulative diff with no exact
-patch inspected also unlocks that recovery turn and directs it to the riskiest
-changed-file patches. Oversized per-file patches return patch-line continuation
-metadata for a narrower follow-up. An independent verifier runs only when discovery produced candidates.
+turn with at most two calls. A truncated initial cumulative diff with fewer than
+the bounded target of two exact patches inspected also unlocks that recovery
+turn and directs it to the riskiest changed-file patches. Once that target is
+met, intentional prompt shortening no longer makes coverage incomplete; an
+actually truncated GitHub changed-file listing still does. Oversized per-file
+patches return patch-line continuation metadata for a narrower follow-up. An
+independent verifier runs only when discovery produced candidates.
 DeepSeek reasoning state—including meaningful empty reasoning—is preserved
 across tool calls. Exact reads are memoized, prompts are capped at 72 KB, tool
 results retain marked head/tail previews, and history is compacted to a 120 KB
@@ -116,6 +119,7 @@ node tools/setup-github-app.mjs \
   --organization YOUR_ORGANIZATION
 
 bunx wrangler secret put OPENROUTER_API_KEY
+bunx wrangler secret put DASHBOARD_TOKEN
 ```
 
 The setup helper stores the GitHub App ID, private key, and webhook secret
@@ -126,6 +130,8 @@ permissions, installation, verification, and troubleshooting.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `DASHBOARD_TOKEN` | — | Required bearer token for the live per-PR review workspace; when unset, the API stays hidden behind `404` |
+| `DASHBOARD_URL` | Worker URL | Public dashboard origin used by GitHub check-run **Details** links; incoming webhooks override it with their own origin |
 | `REVIEW_MODEL` | `deepseek/deepseek-v4-flash-0731:exacto` | OpenRouter model and tool-quality-first routing variant |
 | `REVIEW_REASONING_EFFORT` | `high` | Fixed review effort; Gaston rejects lower values rather than silently downgrading reasoning |
 | `REVIEW_MODEL_MAX_OUTPUT_TOKENS` | `64000` | Per-attempt completion ceiling; normal requests start at 32,000 and a true length exhaustion can use this ceiling |
@@ -148,10 +154,11 @@ rules reviewing it.
 ## Security and cost controls
 
 The public Worker URL is not an inference API. Only a correctly signed GitHub
-webhook can enqueue a review; all other routes return `404`, and invalid webhook
-requests are rejected before OpenRouter is called. The OpenRouter key is stored
-as an encrypted Cloudflare secret and appears only in the outbound authorization
-header.
+webhook can enqueue a review. The live review API is read-only and requires the
+`DASHBOARD_TOKEN` bearer secret; it returns `404` when the secret is not
+configured and `401` for an invalid token. Invalid webhook requests are rejected
+before OpenRouter is called. Secrets are stored by Cloudflare and never bundled
+into the browser application.
 
 Structured Worker logs report each review phase and model attempt, including the
 requested and returned model, provider, elapsed time, request size, tool names,
@@ -184,6 +191,15 @@ bunx wrangler dev
 bunx wrangler deploy --dry-run
 bun run diagnose:pr -- OWNER/REPOSITORY#123
 ```
+
+For local full-stack development, run `bun run dev` and `bun run dev:ui` in
+separate terminals. Vite proxies `/api` to the local Worker. Open the UI, enter
+an `owner/repository`, pull request number, and the dashboard token. The token is
+kept in `sessionStorage`; it is not written to the URL or persisted in the
+Worker. A session appears after that pull request has started a review on this
+version of Gaston. Gaston's GitHub check run uses its native **Details** link to
+open this workspace with the repository and pull request already selected; the
+dashboard token is never included in that link.
 
 `eval:harness` replays synthetic provider/tool trajectories and gates precision,
 recall, model requests, tool calls, and cost. Real-repository historical corpora

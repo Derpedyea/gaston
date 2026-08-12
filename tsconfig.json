@@ -11,6 +11,9 @@
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    },
     "verbatimModuleSyntax": true
   },
   "include": ["worker-configuration.d.ts", "src/**/*.ts", "test/**/*.ts", "vitest.config.ts"]

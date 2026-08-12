@@ -8,7 +8,10 @@ import {
 } from "@cloudflare/computer";
 
 import { DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST, ReviewAgent } from "./agent.ts";
-import type { EvidenceCoverage } from "./evidence.ts";
+import {
+  mergeEvidenceCoverage,
+  type EvidenceCoverage,
+} from "./evidence.ts";
 import {
   DEFAULT_REVIEW_BUDGET,
   formatBudgetSummary,
@@ -17,13 +20,23 @@ import {
   type ReviewBudgetSnapshot,
 } from "./budget.ts";
 import { withCheckpoint } from "./checkpoint.ts";
-import { LatestHeadCoordinator, type CoordinatorStorage } from "./coordinator.ts";
+import { LatestHeadCoordinator, type CoordinatorStorage, type ReviewPhase } from "./coordinator.ts";
 import { GitHubClient } from "./github.ts";
 import { errorMessage, logError, logInfo } from "./log.ts";
 import { discoveryPrompt, REVIEW_LENS, verificationPrompt } from "./prompts.ts";
 import { filterFindings, parseChangedLines } from "./review-core.ts";
-import { RepositoryTools, RepositoryWorkspace } from "./repository.ts";
+import {
+  RepositoryTools,
+  RepositoryWorkspace,
+  REVIEW_SESSION_DIFF_PATH,
+  REVIEW_SESSION_FILES_PATH,
+} from "./repository.ts";
 import { RetryableReviewError, shouldRetryReviewError } from "./retry.ts";
+import type {
+  ReviewSessionFile,
+  ReviewSessionSnapshot,
+  StoredReviewSession,
+} from "./session.ts";
 import type { Env, Finding, ReviewJob, ReviewOutcome, ReviewOutput } from "./types.ts";
 
 export { WorkspaceProxy };
@@ -61,6 +74,8 @@ interface ExecutionLease {
   generation: number;
 }
 
+const REVIEW_SESSION_KEY = "session:latest:v1";
+
 function workspaceOptions(self: InstanceType<typeof ReviewerBase>): WorkspaceOptions {
   const { ctx } = self as unknown as { ctx: DurableObjectState };
   return {
@@ -90,6 +105,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         if (!claim.accepted) {
           return this.#finishSuperseded(job, prepared.github, prepared.checkRunId, "claim", lease);
         }
+        await this.#startSession(job, lease, prepared.checkRunId, claim.state.phase);
 
         // The durable claim is committed before the in-memory cancellation.
         // The map only accelerates interruption; correctness comes from the
@@ -116,6 +132,89 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     ]).then(() => undefined);
     this.#active.set(key, { runKey: key, headSha: job.headSha, controller, promise: run });
     return run;
+  }
+
+  async sessionRevision(): Promise<number | undefined> {
+    return (await this.ctx.storage.get<StoredReviewSession>(REVIEW_SESSION_KEY))?.revision;
+  }
+
+  async session(): Promise<ReviewSessionSnapshot | undefined> {
+    const stored = await this.ctx.storage.get<StoredReviewSession>(REVIEW_SESSION_KEY);
+    if (stored === undefined) return undefined;
+
+    let diff = "";
+    let files: ReviewSessionFile[] = [];
+    let changesTruncated = false;
+    try {
+      if (!stored.artifactsReady) {
+        return { ...stored, files, diff, changesTruncated };
+      }
+      using workspace = await getWorkspace(this);
+      const [storedDiff, storedFiles] = await Promise.all([
+        workspace.fs.readFile(REVIEW_SESSION_DIFF_PATH, "utf8"),
+        workspace.fs.readFile(REVIEW_SESSION_FILES_PATH, "utf8"),
+      ]);
+      const artifact = JSON.parse(storedFiles) as { files?: ReviewSessionFile[]; truncated?: boolean };
+      diff = storedDiff;
+      files = artifact.files ?? [];
+      changesTruncated = artifact.truncated === true;
+    } catch {
+      // The workspace artifacts are created during discovery. Queued and
+      // starting sessions intentionally return an empty change set.
+    }
+
+    return { ...stored, files, diff, changesTruncated };
+  }
+
+  async #startSession(
+    job: ReviewJob,
+    lease: ExecutionLease,
+    checkRunId: number,
+    phase: ReviewPhase,
+  ): Promise<void> {
+    const current = await this.ctx.storage.get<StoredReviewSession>(REVIEW_SESSION_KEY);
+    await this.ctx.storage.put<StoredReviewSession>(REVIEW_SESSION_KEY, {
+      schemaVersion: 1,
+      revision: (current?.revision ?? 0) + 1,
+      runKey: lease.runKey,
+      artifactsReady: false,
+      job,
+      phase,
+      checkRunId,
+      updatedAt: Date.now(),
+      progressTitle: "Review accepted",
+    });
+  }
+
+  async #updateSession(
+    lease: ExecutionLease,
+    patch: Partial<Omit<StoredReviewSession, "schemaVersion" | "revision" | "runKey" | "job">>,
+  ): Promise<boolean> {
+    return this.ctx.storage.transaction(async (transaction) => {
+      const current = await transaction.get<StoredReviewSession>(REVIEW_SESSION_KEY);
+      if (current?.runKey !== lease.runKey) return false;
+      await transaction.put<StoredReviewSession>(REVIEW_SESSION_KEY, {
+        ...current,
+        ...patch,
+        revision: current.revision + 1,
+        updatedAt: Date.now(),
+      });
+      return true;
+    });
+  }
+
+  async #markSessionPhase(
+    lease: ExecutionLease,
+    phase: ReviewPhase,
+    checkRunId?: number,
+  ): Promise<boolean> {
+    const marked = await this.#coordinator.markPhase(lease.runKey, lease.generation, phase, checkRunId);
+    if (!marked) return false;
+    await this.#updateSession(lease, {
+      phase,
+      ...(checkRunId === undefined ? {} : { checkRunId }),
+    });
+    return true;
   }
 
   async #prepare(job: ReviewJob): Promise<ReviewPreparation> {
@@ -181,7 +280,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       if (signal.aborted || !(await this.#coordinator.isCurrent(lease.runKey, lease.generation))) {
         return await this.#finishSuperseded(job, github, checkRunId, "start", lease);
       }
-      if (!(await this.#coordinator.markPhase(lease.runKey, lease.generation, "starting", checkRunId))) {
+      if (!(await this.#markSessionPhase(lease, "starting", checkRunId))) {
         return await this.#finishSuperseded(job, github, checkRunId, "start", lease);
       }
       const pull = await github.getPull(job, signal);
@@ -210,7 +309,13 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         coverageSufficient: coverage.sufficient,
         coverageLimitations: coverage.limitations,
       });
-      if (!(await this.#coordinator.markPhase(lease.runKey, lease.generation, "publishing", checkRunId))) {
+      await this.#updateSession(lease, {
+        review,
+        coverage,
+        budget: budget.snapshot(),
+        progressTitle: "Preparing GitHub review",
+      });
+      if (!(await this.#markSessionPhase(lease, "publishing", checkRunId))) {
         return await this.#finishSuperseded(job, github, checkRunId, "publish", lease);
       }
       const latest = await github.getPull(job, signal);
@@ -230,7 +335,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         logError("review.summary_failed", { ...reviewLogFields(job), error: errorMessage(error) });
       });
       await github.completeCheck(job, checkRunId, review, budget.snapshot(), coverage);
-      await this.#coordinator.markPhase(lease.runKey, lease.generation, "completed", checkRunId);
+      await this.#markSessionPhase(lease, "completed", checkRunId);
 
       const outcome: ReviewOutcome = {
         status: coverage.sufficient ? "completed" : "incomplete",
@@ -239,6 +344,11 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       };
       await this.ctx.storage.put({
         [key]: outcome,
+      });
+      await this.#updateSession(lease, {
+        outcome,
+        budget: budget.snapshot(),
+        progressTitle: outcome.status === "completed" ? "Review complete" : "Review complete with limited evidence",
       });
       logInfo("review.completed", { ...reviewLogFields(job), checkRunId, findings: outcome.findings });
       return outcome;
@@ -265,10 +375,16 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
           queueAttempt: job.queueAttempt ?? 1,
           error: errorMessage(error),
         });
-        await this.#coordinator.markPhase(lease.runKey, lease.generation, "interrupted", checkRunId);
+        await this.#markSessionPhase(lease, "interrupted", checkRunId);
+        await this.#updateSession(lease, {
+          budget: budget.snapshot(),
+          progressTitle: "Review interrupted; retrying",
+        });
         throw new RetryableReviewError(error);
       }
       await github.failCheck(job, checkRunId, error).catch(() => undefined);
+      await this.#markSessionPhase(lease, "interrupted", checkRunId);
+      await this.#updateSession(lease, { progressTitle: "Review failed" });
       logError("review.failed", { ...reviewLogFields(job), checkRunId, error: errorMessage(error) });
       throw retryable ? new RetryableReviewError(error) : error;
     } finally {
@@ -300,7 +416,12 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       });
     });
     await this.ctx.storage.put(completionKey(job), outcome);
-    await this.#coordinator.markPhase(lease.runKey, lease.generation, "completed", checkRunId);
+    await this.#markSessionPhase(lease, "completed", checkRunId);
+    await this.#updateSession(lease, {
+      outcome,
+      budget: snapshot,
+      progressTitle: `Review stopped at the ${reason}`,
+    });
     logInfo("review.budget_exhausted", {
       ...reviewLogFields(job),
       checkRunId,
@@ -325,7 +446,11 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         error: errorMessage(error),
       });
     });
-    await this.#coordinator.markPhase(lease.runKey, lease.generation, "superseded", checkRunId);
+    await this.#markSessionPhase(lease, "superseded", checkRunId);
+    await this.#updateSession(lease, {
+      outcome,
+      progressTitle: "Superseded by a newer pull request head",
+    });
     logInfo("review.superseded", { ...reviewLogFields(job), phase, checkRunId });
     return outcome;
   }
@@ -338,7 +463,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     budget: ReviewBudget,
     lease: ExecutionLease,
   ): Promise<AnalysisResult> {
-    if (!(await this.#coordinator.markPhase(lease.runKey, lease.generation, "discovery", checkRunId))) {
+    if (!(await this.#markSessionPhase(lease, "discovery", checkRunId))) {
       throw new Error("review superseded before discovery");
     }
     const [changes, checks] = await Promise.all([
@@ -348,6 +473,11 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     using workspace = await getWorkspace(this);
     const repository = new RepositoryWorkspace(workspace, github, job, changes);
     await repository.initialize(checks);
+    await this.#updateSession(lease, {
+      artifactsReady: true,
+      progressTitle: "Loaded cumulative pull request changes",
+      budget: budget.snapshot(),
+    });
     const policy = await repository.reviewPolicy(signal);
     const agent = new ReviewAgent({
       apiKey: this.env.OPENROUTER_API_KEY,
@@ -366,7 +496,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     const tools = new RepositoryTools(repository);
 
     const changedLines = parseChangedLines(changes.diff);
-    await this.#updateProgress(job, github, checkRunId, "Scanning changed code", budget.snapshot());
+    await this.#updateProgress(job, github, checkRunId, "Scanning changed code", budget.snapshot(), lease);
     const startedAt = Date.now();
     const checkpoint = lensCheckpointKey(job, REVIEW_LENS.id);
     const { value: discovery, cached } = await withCheckpoint(
@@ -408,8 +538,8 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       return { review, inlineFindings: [], coverage };
     }
 
-    await this.#updateProgress(job, github, checkRunId, "Verifying candidate findings", budget.snapshot());
-    if (!(await this.#coordinator.markPhase(lease.runKey, lease.generation, "verification", checkRunId))) {
+    await this.#updateProgress(job, github, checkRunId, "Verifying candidate findings", budget.snapshot(), lease);
+    if (!(await this.#markSessionPhase(lease, "verification", checkRunId))) {
       throw new Error("review superseded before verification");
     }
     const verified = await agent.run(
@@ -425,7 +555,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       : filtered;
     const verificationCoverage = tools.coverage();
     const coverage = cached
-      ? mergeCoverage(discovery.coverage, verificationCoverage)
+      ? mergeEvidenceCoverage(discovery.coverage, verificationCoverage)
       : verificationCoverage;
     logInfo("review.repository_cache", {
       ...reviewLogFields(job),
@@ -440,31 +570,13 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     checkRunId: number,
     title: string,
     snapshot: ReviewBudgetSnapshot,
+    lease: ExecutionLease,
   ): Promise<void> {
     await github.updateCheckProgress(job, checkRunId, title, formatBudgetSummary(snapshot)).catch((error) => {
       logError("review.progress_failed", { ...reviewLogFields(job), checkRunId, error: errorMessage(error) });
     });
+    await this.#updateSession(lease, { progressTitle: title, budget: snapshot });
   }
-}
-
-function mergeCoverage(left: EvidenceCoverage, right: EvidenceCoverage): EvidenceCoverage {
-  const limitations = [...new Set([...left.limitations, ...right.limitations])].slice(0, 20);
-  return {
-    sufficient: left.sufficient && right.sufficient && limitations.length === 0,
-    totalChangedFiles: Math.max(left.totalChangedFiles, right.totalChangedFiles),
-    inspectedChangedFiles: Math.min(
-      Math.max(left.totalChangedFiles, right.totalChangedFiles),
-      left.inspectedChangedFiles + right.inspectedChangedFiles,
-    ),
-    toolCalls: left.toolCalls + right.toolCalls,
-    okResults: left.okResults + right.okResults,
-    truncatedResults: left.truncatedResults + right.truncatedResults,
-    transientErrors: left.transientErrors + right.transientErrors,
-    permanentErrors: left.permanentErrors + right.permanentErrors,
-    invalidArguments: left.invalidArguments + right.invalidArguments,
-    initialDiffTruncated: left.initialDiffTruncated || right.initialDiffTruncated,
-    limitations,
-  };
 }
 
 function completionKey(job: ReviewJob): string {

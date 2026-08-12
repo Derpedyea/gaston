@@ -271,6 +271,7 @@ export class GitHubClient {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
+        ...checkDetails(job),
         status: "in_progress",
         started_at: new Date().toISOString(),
         output: { title: "Reviewing pull request", summary: "Gaston is inspecting the change and repository context." },
@@ -287,6 +288,7 @@ export class GitHubClient {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
+        ...checkDetails(job),
         status: "in_progress",
         output: { title: title.slice(0, 255), summary: summary.slice(0, 4_000) },
       }),
@@ -315,6 +317,7 @@ export class GitHubClient {
         name: CHECK_NAME,
         head_sha: job.headSha,
         external_id: externalId,
+        ...checkDetails(job),
         status,
         ...(queued ? {} : { started_at: new Date().toISOString() }),
         output: queued
@@ -337,6 +340,7 @@ export class GitHubClient {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
+        ...checkDetails(job),
         status: "completed",
         completed_at: new Date().toISOString(),
         conclusion: findingCount === 0 && !incomplete ? "success" : "neutral",
@@ -361,6 +365,7 @@ export class GitHubClient {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
+        ...checkDetails(job),
         status: "completed",
         completed_at: new Date().toISOString(),
         conclusion: "failure",
@@ -378,6 +383,7 @@ export class GitHubClient {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
+        ...checkDetails(job),
         status: "completed",
         completed_at: new Date().toISOString(),
         conclusion: "neutral",
@@ -398,6 +404,7 @@ export class GitHubClient {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
+        ...checkDetails(job),
         status: "completed",
         completed_at: new Date().toISOString(),
         conclusion: "cancelled",
@@ -551,6 +558,25 @@ export async function createAppJwt(appId: string, privateKeyPem: string, now = D
 
 function reviewMarker(job: ReviewJob): string {
   return `gaston-review:${job.pullNumber}:${job.baseSha}:${job.headSha}`;
+}
+
+function checkDetails(job: ReviewJob): { details_url?: string } {
+  if (!job.dashboardUrl) return {};
+  try {
+    const url = new URL(job.dashboardUrl);
+    if (url.protocol !== "https:" && url.hostname !== "localhost" && url.hostname !== "127.0.0.1") {
+      return {};
+    }
+    url.pathname = "/";
+    url.search = new URLSearchParams({
+      repo: `${job.owner}/${job.repo}`,
+      pr: String(job.pullNumber),
+    }).toString();
+    url.hash = "";
+    return { details_url: url.toString() };
+  } catch {
+    return {};
+  }
 }
 
 function renderSummary(review: ReviewOutput): string {

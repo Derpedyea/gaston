@@ -11,6 +11,8 @@ import type {
 
 const ROOT = "/gaston";
 const RUN_ROOT = `${ROOT}/run`;
+export const REVIEW_SESSION_DIFF_PATH = `${RUN_ROOT}/context/diff.patch`;
+export const REVIEW_SESSION_FILES_PATH = `${RUN_ROOT}/context/session-files.json`;
 const REF_CACHE_ROOT = `${ROOT}/cache/refs`;
 const MAX_FILE_BYTES = 400_000;
 const MAX_TOOL_RESULT_BYTES = 12_000;
@@ -56,8 +58,19 @@ export class RepositoryWorkspace {
     await Promise.all([
       this.#workspace.fs.writeFile(`${RUN_ROOT}/context/pr.json`, JSON.stringify(this.#job, null, 2)),
       this.#workspace.fs.writeFile(`${RUN_ROOT}/context/checks.json`, JSON.stringify(checks, null, 2)),
-      this.#workspace.fs.writeFile(`${RUN_ROOT}/context/diff.patch`, this.changes.diff),
+      this.#workspace.fs.writeFile(REVIEW_SESSION_DIFF_PATH, this.changes.diff),
       this.#workspace.fs.writeFile(`${RUN_ROOT}/context/files.json`, JSON.stringify(this.changes.files, null, 2)),
+      this.#workspace.fs.writeFile(REVIEW_SESSION_FILES_PATH, JSON.stringify({
+        files: this.changes.files.map((file) => ({
+          path: file.path,
+          ...(file.previousPath === undefined ? {} : { previousPath: file.previousPath }),
+          status: file.status,
+          additions: file.additions,
+          deletions: file.deletions,
+          patchAvailable: file.patch !== null,
+        })),
+        truncated: this.changes.truncated,
+      })),
     ]);
   }
 
@@ -293,13 +306,18 @@ export class RepositoryTools {
 
   constructor(repo: RepositoryWorkspace) {
     this.#repo = repo;
+    const totalChangedFiles = repo.changes?.files.length ?? 0;
     this.#coverage = new EvidenceCoverageTracker({
-      totalChangedFiles: repo.changes?.files.length ?? 0,
+      totalChangedFiles,
       initialDiffTruncated: Boolean(
         repo.changes?.truncated
-        || (repo.changes?.files.length ?? 0) > 300
+        || totalChangedFiles > 300
         || byteLength(repo.changes?.diff ?? "") > 40_000,
       ),
+      // GitHub's pull-files endpoint is capped at 300 entries. The same
+      // PullChangeSet flag also represents an oversized cumulative diff, so
+      // only a full 300-file response proves that paths may actually be absent.
+      changedFileListingTruncated: Boolean(repo.changes?.truncated && totalChangedFiles >= 300),
     });
   }
 

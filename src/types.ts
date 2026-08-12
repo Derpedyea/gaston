@@ -23,6 +23,7 @@ export interface ReviewJob {
   queuedAt: string;
   trigger: "automatic" | "manual";
   requestedBy?: string;
+  dashboardUrl?: string;
   queueAttempt?: number;
 }
 
@@ -35,6 +36,7 @@ export interface ManualReviewRequest {
   pullNumber: number;
   commentId: number;
   requestedBy: string;
+  dashboardUrl?: string;
   queuedAt: string;
 }
 
@@ -87,6 +89,7 @@ export interface ReviewOutcome {
 }
 
 export interface Env extends Cloudflare.Env {
+  DASHBOARD_TOKEN?: string;
   GITHUB_APP_ID: string;
   GITHUB_PRIVATE_KEY: string;
   GITHUB_WEBHOOK_SECRET: string;

@@ -25,6 +25,7 @@ export function manualReviewJob(request: ManualReviewRequest, pull: PullRequestS
     queuedAt: request.queuedAt,
     trigger: "manual",
     requestedBy: request.requestedBy,
+    ...(request.dashboardUrl === undefined ? {} : { dashboardUrl: request.dashboardUrl }),
   };
 }
 

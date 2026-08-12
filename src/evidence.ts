@@ -45,7 +45,11 @@ export interface EvidenceTools {
 interface CoverageOptions {
   totalChangedFiles: number;
   initialDiffTruncated: boolean;
+  changedFileListingTruncated?: boolean;
 }
+
+const MAX_REQUIRED_PATCHES_FOR_TRUNCATED_DIFF = 2;
+export const INITIAL_DIFF_RECOVERY_LIMITATION_PREFIX = "The initial cumulative diff was truncated;";
 
 /**
  * Accumulates observable evidence quality behind one small interface. A later
@@ -93,8 +97,7 @@ export class EvidenceCoverageTracker {
       if (tool === "read_file" && changedPath) this.#unresolved.delete(`diff_for_file:${changedPath}`);
       if (tool === "diff_for_file" && changedPath) {
         // A bounded exact patch slice is the intended recovery for an
-        // oversized full-patch response. Resolve that earlier hazard while
-        // retaining the run-level initial-diff limitation.
+        // oversized full-patch response and the initial prompt excerpt.
         this.#unresolved.delete(`diff_for_file:${changedPath}`);
         this.#inspectedChangedFiles.add(changedPath);
       }
@@ -113,9 +116,17 @@ export class EvidenceCoverageTracker {
 
   snapshot(): EvidenceCoverage {
     const unresolved = [...this.#unresolved.values()];
+    const requiredPatches = requiredPatchesForTruncatedDiff(
+      this.#options.totalChangedFiles,
+      this.#options.initialDiffTruncated,
+    );
+    const missingPatches = Math.max(0, requiredPatches - this.#inspectedChangedFiles.size);
     const limitations = [
-      ...(this.#options.initialDiffTruncated
-        ? ["The initial cumulative diff or changed-file listing was truncated."]
+      ...(this.#options.changedFileListingTruncated
+        ? ["GitHub truncated the changed-file listing, so some changed paths may be unavailable."]
+        : []),
+      ...(missingPatches > 0
+        ? [initialDiffRecoveryLimitation(missingPatches)]
         : []),
       ...unresolved.map((entry) => entry.limitation),
     ];
@@ -133,6 +144,50 @@ export class EvidenceCoverageTracker {
       limitations: [...new Set(limitations)].slice(0, 20),
     };
   }
+}
+
+export function requiredPatchesForTruncatedDiff(
+  totalChangedFiles: number,
+  initialDiffTruncated: boolean,
+): number {
+  if (!initialDiffTruncated) return 0;
+  return Math.min(Math.max(0, totalChangedFiles), MAX_REQUIRED_PATCHES_FOR_TRUNCATED_DIFF);
+}
+
+export function initialDiffRecoveryLimitation(missingPatches: number): string {
+  return `${INITIAL_DIFF_RECOVERY_LIMITATION_PREFIX} inspect ${missingPatches} more exact changed-file ${missingPatches === 1 ? "patch" : "patches"}.`;
+}
+
+export function mergeEvidenceCoverage(left: EvidenceCoverage, right: EvidenceCoverage): EvidenceCoverage {
+  const totalChangedFiles = Math.max(left.totalChangedFiles, right.totalChangedFiles);
+  const inspectedChangedFiles = Math.min(
+    totalChangedFiles,
+    left.inspectedChangedFiles + right.inspectedChangedFiles,
+  );
+  const initialDiffTruncated = left.initialDiffTruncated || right.initialDiffTruncated;
+  const missingPatches = Math.max(
+    0,
+    requiredPatchesForTruncatedDiff(totalChangedFiles, initialDiffTruncated) - inspectedChangedFiles,
+  );
+  const limitations = [...new Set([
+    ...left.limitations,
+    ...right.limitations,
+  ].filter((limitation) => !limitation.startsWith(INITIAL_DIFF_RECOVERY_LIMITATION_PREFIX)))];
+  if (missingPatches > 0) limitations.unshift(initialDiffRecoveryLimitation(missingPatches));
+  const boundedLimitations = limitations.slice(0, 20);
+  return {
+    sufficient: boundedLimitations.length === 0,
+    totalChangedFiles,
+    inspectedChangedFiles,
+    toolCalls: left.toolCalls + right.toolCalls,
+    okResults: left.okResults + right.okResults,
+    truncatedResults: left.truncatedResults + right.truncatedResults,
+    transientErrors: left.transientErrors + right.transientErrors,
+    permanentErrors: left.permanentErrors + right.permanentErrors,
+    invalidArguments: left.invalidArguments + right.invalidArguments,
+    initialDiffTruncated,
+    limitations: boundedLimitations,
+  };
 }
 
 export function emptyEvidenceCoverage(totalChangedFiles = 0): EvidenceCoverage {

@@ -187,6 +187,7 @@ describe("GitHubClient review state", () => {
     await expect(testClient().ensureQueuedCheckRun(job())).resolves.toBe(10);
     expect(JSON.parse(requests[1]!.body)).toMatchObject({
       status: "queued",
+      details_url: "https://gaston.example/?repo=owner%2Frepo&pr=1",
       output: { title: "Review queued" },
     });
   });
@@ -203,6 +204,7 @@ describe("GitHubClient review state", () => {
     expect(fetch).toHaveBeenCalledOnce();
     expect(JSON.parse(String(fetch.mock.calls[0]![1]?.body))).toMatchObject({
       status: "in_progress",
+      details_url: "https://gaston.example/?repo=owner%2Frepo&pr=1",
       output: { title: "Reviewing pull request" },
     });
   });
@@ -322,6 +324,7 @@ function job(): ReviewJob {
     baseRef: "main",
     baseSha: "a".repeat(40),
     headSha: "b".repeat(40),
+    dashboardUrl: "https://gaston.example",
     queuedAt: "2026-08-10T00:00:00.000Z",
     trigger: "automatic",
   };

@@ -1,5 +1,5 @@
 import { parseReviewOutput } from "./review-core.ts";
-import type { EvidenceCoverage, EvidenceResult, EvidenceTools } from "./evidence.ts";
+import { requiredPatchesForTruncatedDiff, type EvidenceCoverage, type EvidenceResult, type EvidenceTools } from "./evidence.ts";
 import type { ReviewOutput } from "./types.ts";
 import { ReviewBudget, type ReviewBudgetSnapshot } from "./budget.ts";
 import { errorMessage, logError, logInfo, logWarn } from "./log.ts";
@@ -1177,7 +1177,11 @@ function renderEvidenceResult(result: EvidenceResult): string {
 }
 
 function needsExactPatchRecovery(coverage: EvidenceCoverage | undefined): boolean {
-  return coverage?.initialDiffTruncated === true && coverage.inspectedChangedFiles === 0;
+  if (coverage === undefined) return false;
+  return coverage.inspectedChangedFiles < requiredPatchesForTruncatedDiff(
+    coverage.totalChangedFiles,
+    coverage.initialDiffTruncated,
+  );
 }
 
 function recoveryInstruction(
@@ -1189,12 +1193,17 @@ function recoveryInstruction(
     .filter(({ result }) => result.status === "truncated" || result.status === "invalid_arguments")
     .map(({ result }) => result.suggestedAction)
     .filter((action): action is string => action !== undefined))];
+  const requiredPatches = coverage === undefined
+    ? 0
+    : requiredPatchesForTruncatedDiff(coverage.totalChangedFiles, coverage.initialDiffTruncated);
+  const inspectedPatches = coverage?.inspectedChangedFiles ?? 0;
+  const missingPatches = Math.max(0, requiredPatches - inspectedPatches);
   return [
     "One targeted evidence-recovery turn is available.",
     needsExactPatchRecovery(coverage)
       ? [
-          "The supplied cumulative diff is truncated and no exact changed-file patch has been inspected.",
-          "Use diff_for_file now for the one or two highest-risk paths already present in the changed-file overview; this turn must retrieve code changes, not another tree, changed-files list, or broad search.",
+          `The supplied cumulative diff is truncated and only ${inspectedPatches} of ${requiredPatches} required exact changed-file patches ${inspectedPatches === 1 ? "has" : "have"} been inspected.`,
+          `Use diff_for_file now for ${missingPatches === 1 ? "one additional high-risk path" : "the remaining high-risk paths"} already present in the changed-file overview; this turn must retrieve code changes, not another tree, changed-files list, or broad search.`,
         ].join(" ")
       : "Replace only the truncated evidence or correct the invalid arguments.",
     ...(actions.length === 0 ? [] : [`Follow the tool-provided recovery actions: ${actions.join(" ")}`]),

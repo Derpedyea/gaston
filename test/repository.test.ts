@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { RepositoryTools, RepositoryWorkspace } from "../src/repository.ts";
 import { GitHubApiError } from "../src/github.ts";
+import { EvidenceCoverageTracker, mergeEvidenceCoverage } from "../src/evidence.ts";
 import type { ReviewJob } from "../src/types.ts";
 
 describe("RepositoryWorkspace policy", () => {
@@ -148,6 +149,33 @@ describe("RepositoryTools", () => {
     });
   });
 
+  it("keeps a genuinely truncated GitHub changed-file listing incomplete after patch recovery", async () => {
+    const files = Array.from({ length: 300 }, (_, index) => ({
+      path: `src/${index}.ts`,
+      status: "modified",
+      additions: 1,
+      deletions: 0,
+      patch: "@@ -1 +1 @@\n-old\n+new",
+    }));
+    const repository = new RepositoryWorkspace(
+      {} as never,
+      {} as never,
+      job(),
+      { files, diff: "", truncated: true },
+    );
+    const tools = new RepositoryTools(repository);
+
+    await tools.invoke("diff_for_file", '{"path":"src/0.ts"}');
+    await tools.invoke("diff_for_file", '{"path":"src/1.ts"}');
+
+    expect(tools.coverage()).toMatchObject({
+      sufficient: false,
+      totalChangedFiles: 300,
+      inspectedChangedFiles: 2,
+      limitations: [expect.stringContaining("GitHub truncated the changed-file listing")],
+    });
+  });
+
   it("rejects immediately when a review signal is already aborted", async () => {
     const controller = new AbortController();
     controller.abort(new Error("superseded"));
@@ -184,6 +212,28 @@ describe("RepositoryTools", () => {
       isError: true,
     });
     expect(tools.coverage()).toMatchObject({ sufficient: false, invalidArguments: 1 });
+  });
+});
+
+describe("evidence coverage recovery", () => {
+  it("combines independently recovered patches without preserving stale truncation limitations", () => {
+    const coverage = (path: string) => {
+      const tracker = new EvidenceCoverageTracker({ totalChangedFiles: 41, initialDiffTruncated: true });
+      tracker.record("diff_for_file", {
+        status: "ok",
+        content: "exact patch",
+        retryable: false,
+        evidence: { scope: `diff_for_file:${path}`, complete: true },
+      }, path);
+      return tracker.snapshot();
+    };
+
+    expect(mergeEvidenceCoverage(coverage("src/a.ts"), coverage("src/b.ts"))).toMatchObject({
+      sufficient: true,
+      totalChangedFiles: 41,
+      inspectedChangedFiles: 2,
+      limitations: [],
+    });
   });
 });
 

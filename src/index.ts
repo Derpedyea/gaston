@@ -3,6 +3,7 @@ import { getGitHubAppReadiness, GitHubClient } from "./github.ts";
 import { errorMessage, logError, logInfo } from "./log.ts";
 import { manualReviewJob } from "./review-job.ts";
 import { reviewRetryDelaySeconds, shouldRetryReviewError } from "./retry.ts";
+import { handleReviewSessionApi } from "./session-api.ts";
 import type { Env, ManualReviewRequest, ReviewJob, ReviewOutcome, ReviewQueueMessage } from "./types.ts";
 import { handleGitHubWebhook } from "./webhook.ts";
 
@@ -29,6 +30,7 @@ export default {
         });
       }
     }
+    if (url.pathname.startsWith("/api/reviews/")) return handleReviewSessionApi(request, env);
     if (url.pathname === "/webhooks/github") return handleGitHubWebhook(request, env, ctx);
     return new Response("not found", { status: 404 });
   },
@@ -47,7 +49,11 @@ export default {
           pullNumber: request.pullNumber,
           trigger: isManualReviewRequest(request) ? "manual" : request.trigger,
         });
-        const job = { ...(await resolveReviewJob(request, env)), queueAttempt: message.attempts };
+        const job = {
+          ...(await resolveReviewJob(request, env)),
+          dashboardUrl: request.dashboardUrl ?? env.DASHBOARD_URL,
+          queueAttempt: message.attempts,
+        };
         const generation = env.REVIEWER_GENERATION ?? "1";
         const name = `${generation}:${job.owner}/${job.repo}#${job.pullNumber}`;
         const stub = env.REVIEWER.get(env.REVIEWER.idFromName(name)) as unknown as {

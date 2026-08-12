@@ -141,6 +141,7 @@ describe("toManualReviewRequest", () => {
       deliveryId: "delivery-3",
       pullNumber: 42,
       commentId: 99,
+      dashboardUrl: "https://example.com",
     }), { contentType: "json" });
     expect(waitUntil).toHaveBeenCalledOnce();
     expect(githubFetch).toHaveBeenCalledTimes(2);

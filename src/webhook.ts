@@ -60,9 +60,10 @@ export async function handleGitHubWebhook(
     return response("invalid JSON", 400);
   }
 
+  const dashboardUrl = new URL(request.url).origin;
   const message: ReviewQueueMessage | null = event === "pull_request"
-    ? toReviewJob(payload as PullRequestWebhook, deliveryId)
-    : toManualReviewRequest(payload as IssueCommentWebhook, deliveryId);
+    ? toReviewJob(payload as PullRequestWebhook, deliveryId, dashboardUrl)
+    : toManualReviewRequest(payload as IssueCommentWebhook, deliveryId, dashboardUrl);
   if (!message) {
     logInfo("webhook.ignored", {
       deliveryId,
@@ -110,7 +111,11 @@ export async function verifyWebhookSignature(
   return constantTimeEqual(expected, received);
 }
 
-export function toReviewJob(payload: PullRequestWebhook, deliveryId: string): ReviewJob | null {
+export function toReviewJob(
+  payload: PullRequestWebhook,
+  deliveryId: string,
+  dashboardUrl?: string,
+): ReviewJob | null {
   if (!payload.action || !REVIEW_ACTIONS.has(payload.action)) return null;
   if (payload.pull_request?.draft) return null;
 
@@ -153,12 +158,14 @@ export function toReviewJob(payload: PullRequestWebhook, deliveryId: string): Re
     ...(beforeSha === undefined ? {} : { beforeSha }),
     queuedAt: new Date().toISOString(),
     trigger: "automatic",
+    ...(dashboardUrl === undefined ? {} : { dashboardUrl }),
   };
 }
 
 export function toManualReviewRequest(
   payload: IssueCommentWebhook,
   deliveryId: string,
+  dashboardUrl?: string,
 ): ManualReviewRequest | null {
   if (payload.action !== "created" || payload.issue?.pull_request === undefined) return null;
   const comment = payload.comment;
@@ -200,6 +207,7 @@ export function toManualReviewRequest(
     pullNumber: pullNumber as number,
     commentId: commentId as number,
     requestedBy: requestedBy.slice(0, 100),
+    ...(dashboardUrl === undefined ? {} : { dashboardUrl }),
     queuedAt: new Date().toISOString(),
   };
 }

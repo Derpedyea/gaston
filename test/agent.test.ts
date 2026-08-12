@@ -150,7 +150,7 @@ describe("ReviewAgent", () => {
     expect((requests[1]!.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name))
       .toEqual(["diff_for_file"]);
     const recoveryMessages = requests[1]!.messages as Array<{ role: string; content?: string }>;
-    expect(recoveryMessages.at(-1)?.content).toContain("no exact changed-file patch has been inspected");
+    expect(recoveryMessages.at(-1)?.content).toContain("only 0 of 2 required exact changed-file patches");
     expect(recoveryMessages.at(-1)?.content).toContain("Use diff_for_file now");
   });
 
@@ -216,6 +216,76 @@ describe("ReviewAgent", () => {
       .toEqual(["diff_for_file"]);
     const recoveryMessages = requests[1]!.messages as Array<{ content?: string }>;
     expect(recoveryMessages.at(-1)?.content).toContain("must retrieve code changes");
+  });
+
+  it("continues truncated-diff recovery when a multi-file review inspected only one exact patch", async () => {
+    const requests: Array<Record<string, unknown>> = [];
+    vi.stubGlobal("fetch", vi.fn(async (_input: string, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      requests.push(body);
+      if (requests.length === 1) {
+        return jsonResponse({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [
+                toolCall("patch-a", "diff_for_file", '{"path":"src/a.ts"}'),
+                toolCall("source", "read_file", '{"path":"src/a.ts","ref":"head","start_line":1,"end_line":40}'),
+                toolCall("tree", "repository_tree", '{"prefix":"src"}'),
+                toolCall("search", "search_code", '{"query":"handler"}'),
+              ],
+            },
+          }],
+        });
+      }
+      if (body.tools !== undefined) {
+        return jsonResponse({
+          choices: [{
+            message: {
+              content: null,
+              tool_calls: [toolCall("patch-b", "diff_for_file", '{"path":"src/b.ts"}')],
+            },
+          }],
+        });
+      }
+      return jsonResponse({ choices: [{ message: { content: '{"summary":"recovered","findings":[]}' } }] });
+    }));
+
+    const tracker = new EvidenceCoverageTracker({ totalChangedFiles: 41, initialDiffTruncated: true });
+    const invoke = vi.fn(async (name: string, rawArguments: string): Promise<EvidenceResult> => {
+      const args = JSON.parse(rawArguments) as { path?: string };
+      const result: EvidenceResult = {
+        status: "ok",
+        content: "complete evidence",
+        retryable: false,
+        evidence: { scope: `${name}:${args.path ?? "result"}`, complete: true },
+      };
+      tracker.record(name, result, name === "diff_for_file" ? args.path : undefined);
+      return result;
+    });
+    const agent = new ReviewAgent({
+      apiKey: TEST_API_KEY,
+      model: "deepseek/deepseek-v4-flash-0731",
+      reasoningEffort: "high",
+      repository: "owner/repo",
+    });
+
+    await expect(agent.run("review", {
+      invoke,
+      coverage: () => tracker.snapshot(),
+    }, "discovery")).resolves.toEqual({ summary: "recovered", findings: [] });
+
+    expect(invoke).toHaveBeenCalledTimes(5);
+    expect(tracker.snapshot()).toMatchObject({
+      sufficient: true,
+      totalChangedFiles: 41,
+      inspectedChangedFiles: 2,
+      toolCalls: 5,
+      truncatedResults: 0,
+      limitations: [],
+    });
+    expect((requests[1]!.tools as Array<{ function: { name: string } }>).map((tool) => tool.function.name))
+      .toEqual(["diff_for_file"]);
   });
 
   it("fails closed on an OpenRouter error", async () => {
