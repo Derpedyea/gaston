@@ -111,6 +111,9 @@ describe("toManualReviewRequest", () => {
       if (url.endsWith("/app/installations/123/access_tokens")) {
         return new Response(JSON.stringify({ token: "installation-token" }), { status: 201 });
       }
+      if (url === "https://api.github.com/app") {
+        return new Response(JSON.stringify({ id: 12_345, slug: "gaston" }), { status: 200 });
+      }
       expect(url).toBe("https://api.github.com/repos/owner/repo/issues/comments/99/reactions");
       expect(init?.method).toBe("POST");
       expect(JSON.parse(String(init?.body))).toEqual({ content: "eyes" });
@@ -144,7 +147,7 @@ describe("toManualReviewRequest", () => {
       dashboardUrl: "https://example.com",
     }), { contentType: "json" });
     expect(waitUntil).toHaveBeenCalledOnce();
-    expect(githubFetch).toHaveBeenCalledTimes(2);
+    expect(githubFetch).toHaveBeenCalledTimes(3);
   });
 
   it("ignores issue comments, untrusted users, bots, edits, and non-command prose", () => {

@@ -51,15 +51,22 @@ curl -fsS https://gaston-pr-reviewer.<your-subdomain>.workers.dev/health
 ```
 
 It should print `ok`. The Worker can be deployed before secrets are present;
-only authenticated webhook processing needs them.
+authenticated webhook processing needs the GitHub and OpenRouter secrets, and
+the live dashboard API additionally needs `DASHBOARD_TOKEN`.
 
 ## 4. Create an OpenRouter key
 
 Create a dedicated key in OpenRouter rather than reusing a broad personal key.
-Set a conservative credit limit while testing. Gaston's default model has a
-one-million-token context window and current provider pricing on its
-[OpenRouter model page](https://openrouter.ai/deepseek/deepseek-v4-flash-0731), but
-pricing can change.
+Set a conservative credit limit while testing. Gaston's default GPT-5.6 Luna
+model has a 1.05-million-token context window and 128,000-token maximum output;
+current pricing and provider availability are listed on its
+[OpenRouter model page](https://openrouter.ai/openai/gpt-5.6-luna), but can change.
+Gaston defaults to the measured OpenAI route, sends `data_collection: deny`, and
+uses that endpoint's `max_tokens` contract. Strict zero-data retention is not
+enabled by default. For repositories that require it, set
+`REVIEW_PROVIDER=azure` and `REVIEW_REQUIRE_ZDR=true` in `wrangler.jsonc`; Gaston
+then uses Azure's `max_completion_tokens` contract. Retries preserve the pinned
+provider and privacy settings.
 
 Store it interactively so it does not enter shell history:
 
@@ -200,28 +207,61 @@ and outcome for direct filtering in Workers Logs or `wrangler tail`.
 ## 8. Cost and rollout controls
 
 Start with one or two repositories. Queue concurrency is set to three and each
-tool result is bounded. Discovery has one normal evidence turn, a four-call
-tool cap, and a tool-disabled finalization turn. A truncated result or invalid
-tool payload can unlock exactly one focused two-call recovery turn. Verification runs only when discovery
-returns a changed-line candidate. Every phase and retry shares the default
+tool result is bounded. With `REVIEW_DIRECT_DISCOVERY=true`, a complete diff
+that already fits the prompt uses one structured, tool-free issue-list request;
+candidate verification still receives harness-fetched exact anchors. A diff
+with omitted or truncated evidence retains the repository-agent path: one
+normal evidence turn, a four-call tool cap, and a tool-disabled finalization
+turn. A truncated or invalid result,
+an exact-patch coverage shortfall, or an inventory-only first batch can unlock
+one focused two-call recovery batch. A new uncovered exact-patch continuation
+may unlock one final patch-only batch, under the eight-call phase ceiling.
+Verification runs only when discovery returns a changed-line candidate. It
+must return one explicit `confirmed`, `refuted`, or `insufficient` verdict per
+candidate. Repository evidence is exposed through opaque harness-issued handles,
+and terminal verdicts are accepted only for handles that the verifier's own
+phase-local coverage ledger marks complete. A successful narrow read can
+supersede an earlier broad truncated read of the same file. Discovery reads
+cannot satisfy that boundary. Missing or malformed verdicts remain unresolved
+rather than becoming silent refutations, and an unresolved candidate forces a
+neutral—not successful—terminal check. Every phase and retry shares the default
 fourteen-minute, nine-request, 250,000 estimated-input-token, 128,000 output-token,
 and $0.20 reported-cost budget. The active resource ledger survives queue
 redelivery without counting queue backoff as work. Prompts are capped at 72 KB, individual tool
-results at 12 KB with visible head/tail previews, and history is compacted
-toward 120 KB. Completed analysis is checkpointed so publishing retries do not restart inference. Keep
+results at 12 KB, and history is compacted toward 120 KB. Structured inventory
+and patch results remain valid JSON with continuation metadata; bounded prose
+and file reads use visible head/tail previews. Completed analysis is checkpointed
+so publishing retries do not restart inference. Keep
 OpenRouter's independent per-key spend limit enabled as defense in depth.
 Cloudflare billing here is standard Worker/Queue/Durable Object compute and
 SQLite storage—there is no Container or Dynamic Worker allocation.
 
 Tune `wrangler.jsonc` only after observing real reviews:
 
-- Raise `REVIEW_MIN_CONFIDENCE` to reduce noise.
-- Keep `REVIEW_REASONING_EFFORT=high`; Gaston rejects lower values so every
-  discovery, verification, finalization, repair, and retry uses high reasoning.
+- Raise `REVIEW_MIN_CONFIDENCE` above its `0.80` default to reduce noise for
+  independently verified findings. Completeness is candidate-bound: an
+  unrelated unresolved candidate remains unpublished and keeps the overall
+  check neutral, but does not raise the threshold for a complete confirmation.
+- Set `REVIEW_REASONING_EFFORT=high`, `xhigh`, or `max`; the measured default is
+  `max`, and Gaston rejects lower values.
+  The final source-frozen effort comparison tested both `xhigh` and `max` on
+  the same fresh snapshots; `max` retained the only canonical published bug.
+  Rerun a fresh sealed corpus before changing this default.
+- Keep `REVIEW_PROVIDER=openai` for the measured default route. If repository
+  policy requires zero retention, change it to `azure` and set
+  `REVIEW_REQUIRE_ZDR=true` together. The provider controls the output-token
+  field, and invalid provider, boolean, or Luna OpenAI+ZDR combinations fail
+  before inference. When changing `REVIEW_MODEL`, select and conformance-test
+  its provider at the same time rather than retaining the Luna-specific pin.
 - Review `REVIEW_MODEL_MAX_OUTPUT_TOKENS` whenever `REVIEW_MODEL` changes; it is
   a per-request policy ceiling, not automatic model-capability discovery.
-- Keep the `:exacto` variant when tool-call reliability matters more than
-  throughput-first routing; an explicit OpenRouter provider sort overrides it.
+- Keep `REVIEW_DIRECT_DISCOVERY=true` for the shallow complete-diff path. Set it
+  to `false` only for a controlled comparison that intentionally restores
+  discovery-time repository browsing on every PR.
+- For model slugs that offer an `:exacto` variant, prefer it when tool-call
+  reliability matters more than throughput-first routing; the default Luna
+  slug has no such suffix, and an explicit OpenRouter provider sort overrides
+  a model variant.
 - Lower `REVIEW_MAX_COST_USD` or `REVIEW_MAX_MODEL_REQUESTS` to tighten the
   aggregate review budget.
 - Do not raise `REVIEW_MAX_WALL_TIME_MS` above fourteen minutes in this Queue
@@ -237,7 +277,10 @@ bun run check
 bun run deploy
 ```
 
-`bun run check` also validates the 25-PR historical corpus and runs deterministic
-provider/tool replays with precision, recall, p95 request, p95 tool-call, and
-p95 cost gates. A clean GitHub check is emitted only when the evidence ledger is
+`bun run check` also runs the historical-manifest validator—which explicitly
+skips unless `GASTON_HISTORICAL_CORPUS` is set—and deterministic provider/tool
+protocol replays. Those scripted precision/recall
+numbers are regression-fixture checks, not evidence of live model quality; use
+hidden exact-SHA snapshots with semantic or executable adjudication for quality
+comparisons. A clean GitHub check is emitted only when the evidence ledger is
 complete; infrastructure or truncation hazards end neutral with coverage details.

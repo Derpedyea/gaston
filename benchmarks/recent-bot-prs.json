@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "name": "recent-bot-prs-2026-08-13",
+  "frozenAt": "2026-08-13T21:30:00.000Z",
+  "description": "Consumed public regression corpus built from exact recent PR heads reviewed by Macroscope or Cursor Bugbot. Labels and later fixes are evaluator-only and must never enter model prompts.",
+  "cases": [
+    {
+      "id": "t3code-draft-carry-await",
+      "repository": "pingdotgg/t3code",
+      "pullNumber": 6393,
+      "title": "fix(web): keep the typed prompt when a draft changes repo",
+      "baseSha": "ac1264e2cab1f357cc683bc52c32bcec23845f32",
+      "headSha": "a4443f751950466c54eb143c08e6bdbf55ed10e7",
+      "bots": ["macroscopeapp[bot]"],
+      "labels": [
+        {
+          "id": "content-added-during-await-is-not-carried",
+          "path": "apps/web/src/hooks/useHandleNewThread.ts",
+          "side": "RIGHT",
+          "lineStart": 135,
+          "lineEnd": 160,
+          "rootCause": "The source draft ID is captured only when the pre-await content snapshot is non-empty. Content typed or attached while resolveDefaultEnvMode awaits is therefore left behind instead of being moved to the new draft.",
+          "requiredTermGroups": [
+            ["content", "prompt", "typed", "attachment"],
+            ["await", "async", "resolveDefaultEnvMode", "delay"],
+            ["snapshot", "pre-await", "during", "move time", "later"]
+          ],
+          "reviewUrl": "https://github.com/pingdotgg/t3code/pull/6393#discussion_r3771050356",
+          "fixSha": "0276a4ce9c2e78a0e296498423c9cddded28e47f"
+        }
+      ]
+    },
+    {
+      "id": "t3code-bare-padding-regression",
+      "repository": "pingdotgg/t3code",
+      "pullNumber": 6293,
+      "title": "fix(web): align mobile onboarding header",
+      "baseSha": "5a84614809b6e853b872f9e57ff4b97e9df5df02",
+      "headSha": "3b0619528d0177c45ae626f628493427b4963870",
+      "bots": ["cursor[bot]"],
+      "labels": [
+        {
+          "id": "padding-regression-test-misses-bare-class",
+          "path": "apps/web/src/routes/-chatIndexTitlebar.test.ts",
+          "side": "RIGHT",
+          "lineStart": 15,
+          "lineEnd": 20,
+          "rootCause": "The regression regex only matches py- at the start of the class string or after a variant colon. A normal bare py-* utility following another class starts after a space and slips through, so the test does not protect the padding regression.",
+          "requiredTermGroups": [
+            ["regex", "regexp", "assertion", "test"],
+            ["bare", "space", "py-"],
+            ["miss", "slip", "fail to catch", "does not catch"]
+          ],
+          "reviewUrl": "https://github.com/pingdotgg/t3code/pull/6293#discussion_r3765078393",
+          "fixSha": "864cca20c473d8f946d5db8ce141ba4c1f0b02af"
+        }
+      ]
+    },
+    {
+      "id": "pydantic-harness-usage-anchor",
+      "repository": "pydantic/pydantic-ai-harness",
+      "pullNumber": 582,
+      "title": "Anchor compaction token estimates on provider-reported usage",
+      "baseSha": "00029988a04781a9f1b7139700612d3795e1d9c4",
+      "headSha": "69773f9918d594ce24ed2d89359cd60f3f03c6b3",
+      "bots": ["macroscopeapp[bot]"],
+      "labels": [
+        {
+          "id": "fixed-overhead-is-scaled-as-reclaimable",
+          "path": "pydantic_ai_harness/compaction/_tiered_compaction.py",
+          "side": "RIGHT",
+          "lineStart": 150,
+          "lineEnd": 165,
+          "rootCause": "The full provider baseline, including fixed tool schemas and system instructions, is scaled by the message-text reduction ratio. That greatly overstates reclaimed tokens and can stop compaction while the real request is still above target.",
+          "requiredTermGroups": [
+            ["baseline", "provider-reported", "provider reported"],
+            ["fixed", "tool schema", "system instruction", "overhead"],
+            ["scale", "ratio"],
+            ["reclaim", "stop", "target", "underestimate"]
+          ],
+          "reviewUrl": "https://github.com/pydantic/pydantic-ai-harness/pull/582#discussion_r3757418342",
+          "fixSha": "d92918b7f5cb3d4518e963aec87faca241b04e01"
+        },
+        {
+          "id": "post-anchor-instructions-are-not-counted",
+          "path": "pydantic_ai_harness/compaction/_shared.py",
+          "side": "RIGHT",
+          "lineStart": 208,
+          "lineEnd": 222,
+          "rootCause": "Instructions on ModelRequest messages after the provider-usage anchor are omitted from the estimated tail, so new or changed instructions under-report context size and may prevent required compaction.",
+          "requiredTermGroups": [
+            ["instruction"],
+            ["after", "post-anchor", "tail", "later"],
+            ["anchor", "provider"],
+            ["omit", "skip", "undercount", "under-report", "not count"]
+          ],
+          "reviewUrl": "https://github.com/pydantic/pydantic-ai-harness/pull/582#discussion_r3757418350",
+          "fixSha": "d92918b7f5cb3d4518e963aec87faca241b04e01"
+        }
+      ]
+    },
+    {
+      "id": "quic-go-malformed-priority",
+      "repository": "quic-go/quic-go",
+      "pullNumber": 5783,
+      "title": "http3: implement handling of RFC 9218 priority headers",
+      "baseSha": "ee21d3e0238513a7e9b4c7def7ee907a33e2e8c2",
+      "headSha": "ca03e6b2dc0211cd57311d41305f4c4156956e34",
+      "bots": ["macroscopeapp[bot]", "coderabbitai[bot]"],
+      "labels": [
+        {
+          "id": "invalid-priority-dictionary-partially-applies",
+          "path": "http3/priority.go",
+          "side": "RIGHT",
+          "lineStart": 15,
+          "lineEnd": 44,
+          "rootCause": "parsePriority applies recognized members without validating the complete Structured Fields dictionary. A malformed later member, duplicate key, or trailing separator can leave an earlier urgency applied even though an invalid field must fall back to both defaults.",
+          "requiredTermGroups": [
+            ["malformed", "invalid"],
+            ["dictionary", "member", "duplicate", "trailing"],
+            ["partial", "earlier", "recognized", "appl"],
+            ["default", "ignore", "fallback", "revert"]
+          ],
+          "reviewUrl": "https://github.com/quic-go/quic-go/pull/5783#discussion_r3761817182",
+          "fixSha": "5507385a05ca748f57890a51e31443db1a8d323a"
+        }
+      ]
+    }
+  ]
+}

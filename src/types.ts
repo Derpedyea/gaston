@@ -59,6 +59,32 @@ export interface ReviewOutput {
   findings: Finding[];
 }
 
+export type VerificationVerdictKind = "confirmed" | "refuted" | "insufficient";
+
+/**
+ * A parsed verifier entry. `valid` is harness-owned: malformed model entries
+ * retain a usable candidate identity when possible so they cannot disappear
+ * by omission or accidentally become a refutation.
+ */
+export interface VerificationVerdict {
+  candidateId: string;
+  verdict: VerificationVerdictKind | null;
+  path: string;
+  line: number | null;
+  side: DiffSide | null;
+  confidence: number | null;
+  rationale: string;
+  evidence: string;
+  evidenceComplete: boolean | null;
+  evidenceScopes: string[];
+  valid: boolean;
+}
+
+export interface VerificationOutput {
+  summary: string;
+  verdicts: VerificationVerdict[];
+}
+
 export interface PullFileChange {
   path: string;
   previousPath?: string;
@@ -72,6 +98,10 @@ export interface PullChangeSet {
   files: PullFileChange[];
   diff: string;
   truncated: boolean;
+  filesTruncated?: boolean;
+  diffTruncated?: boolean;
+  /** Changed paths whose exact GitHub patch was omitted or discarded by the memory cap. */
+  unavailablePatchPaths?: string[];
 }
 
 export interface RepositoryEntry {

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "High-precision, budget-bounded GitHub PR reviews with DeepSeek V4 Flash and a Cloudflare Computer-backed agent harness.",
+  "description": "Precision-oriented, budget-bounded GitHub PR reviews with a Cloudflare Computer-backed agent harness.",
   "scripts": {
     "dev": "wrangler dev",
     "dev:ui": "vite",
@@ -14,6 +14,7 @@
     "check:privacy": "bun tools/check-public-tree.ts",
     "diagnose:pr": "bun tools/diagnose-pr.mjs",
     "eval:harness": "bun tools/run-harness-eval.ts",
+    "eval:models": "bun tools/run-recent-pr-bench.ts",
     "eval:historical": "bun tools/validate-historical-corpus.ts",
     "fixtures:capture": "bun tools/capture-historical-prs.ts",
     "test": "vitest run",

@@ -44,6 +44,47 @@ describe("LatestHeadCoordinator", () => {
     expect((await coordinator.state())?.desiredRunKey).toBe("manual:delivery-2");
   });
 
+  it("rejects a delayed older-head delivery after a newer head is persisted", async () => {
+    const storage = new MemoryCoordinatorStorage();
+    const coordinator = new LatestHeadCoordinator(storage);
+    const latest = await coordinator.claim(
+      job("c", "2026-08-10T02:00:00.000Z", "delivery-2"),
+      "head-c",
+      2,
+    );
+    const delayed = await coordinator.claim(
+      job("b", "2026-08-10T01:00:00.000Z", "delivery-1"),
+      "head-b",
+      1,
+    );
+
+    expect(delayed).toMatchObject({ accepted: false, generation: latest.generation });
+    expect(await coordinator.state()).toMatchObject({ desiredHeadSha: "c".repeat(40), desiredRunKey: "head-c" });
+  });
+
+  it("lets the later claimant win an equal-time tie regardless of delivery GUID ordering", async () => {
+    const storage = new MemoryCoordinatorStorage();
+    const coordinator = new LatestHeadCoordinator(storage);
+    const first = await coordinator.claim(
+      job("b", "2026-08-10T02:00:00.000Z", "ffffffff-ffff-ffff-ffff-ffffffffffff"),
+      "first",
+      1,
+    );
+    const laterClaimant = await coordinator.claim(
+      job("c", "2026-08-10T02:00:00.000Z", "00000000-0000-0000-0000-000000000000"),
+      "later",
+      2,
+    );
+
+    expect(first.accepted).toBe(true);
+    expect(laterClaimant).toMatchObject({
+      accepted: true,
+      generation: first.generation + 1,
+      supersededRunKey: "first",
+    });
+    expect(await coordinator.state()).toMatchObject({ desiredRunKey: "later", desiredHeadSha: "c".repeat(40) });
+  });
+
   it("makes a queue redelivery for the same run idempotent", async () => {
     const storage = new MemoryCoordinatorStorage();
     const coordinator = new LatestHeadCoordinator(storage);
@@ -53,6 +94,37 @@ describe("LatestHeadCoordinator", () => {
 
     expect(duplicate).toEqual(first);
     expect(duplicate.generation).toBe(1);
+  });
+
+  it("fences related terminal records inside the same ownership transaction", async () => {
+    const storage = new MemoryCoordinatorStorage();
+    const coordinator = new LatestHeadCoordinator(storage);
+    const first = await coordinator.claim(job("b", "2026-08-10T01:00:00.000Z", "first"), "first", 1);
+    const second = await coordinator.claim(job("c", "2026-08-10T02:00:00.000Z", "second"), "second", 2);
+
+    await expect(coordinator.transitionIfCurrent(
+      "first",
+      first.generation,
+      "completed",
+      1,
+      async (transaction) => transaction.put("outcome:first", "stale terminal write"),
+    )).resolves.toBe(false);
+    await expect(coordinator.transitionIfCurrent(
+      "second",
+      second.generation,
+      "completed",
+      2,
+      async (transaction) => transaction.put("outcome:second", "owned terminal write"),
+    )).resolves.toBe(true);
+
+    expect(storage.values.has("outcome:first")).toBe(false);
+    expect(storage.values.get("outcome:second")).toBe("owned terminal write");
+    expect(await coordinator.state()).toMatchObject({
+      desiredRunKey: "second",
+      generation: second.generation,
+      phase: "completed",
+      checkRunId: 2,
+    });
   });
 });
 

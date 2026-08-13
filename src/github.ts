@@ -10,9 +10,13 @@ import { formatBudgetSummary, type ReviewBudgetSnapshot } from "./budget.ts";
 import type { EvidenceCoverage } from "./evidence.ts";
 import { shouldRequestChanges } from "./review-core.ts";
 
+const MAX_RETAINED_PATCH_BYTES = 2_000_000;
 const API = "https://api.github.com";
 const API_VERSION = "2026-03-10";
 const CHECK_NAME = "Gaston review";
+const RECONCILIATION_LOOKUP_BACKOFF_MS = [100, 300, 900] as const;
+
+type Delay = (delayMs: number) => Promise<void>;
 
 export class GitHubApiError extends Error {
   readonly status: number;
@@ -35,8 +39,20 @@ export class GitHubApiError extends Error {
 interface InstallationTokenResponse { token: string }
 
 interface AuthenticatedGitHubApp {
+  id?: number;
+  slug?: string;
   events?: string[];
   permissions?: Record<string, string>;
+}
+
+interface GitHubActor {
+  login?: string;
+  type?: string;
+}
+
+interface GitHubAppIdentity {
+  id: number;
+  botLogin: string;
 }
 
 interface GitHubAppInstallation {
@@ -78,8 +94,38 @@ interface CheckRun {
 }
 
 interface CheckRunsResponse { check_runs: CheckRun[] }
-interface PullReview { body: string | null; commit_id: string }
-interface IssueComment { id: number; body: string | null }
+export interface PullReview {
+  id?: number;
+  body: string | null;
+  commit_id: string;
+  user?: GitHubActor | null;
+}
+export interface ReviewComparisonIdentity { baseSha: string; headSha: string }
+export interface PublishedReviewReconciliation {
+  reviewId?: number;
+  lookupAttempted: boolean;
+  lookupError?: unknown;
+  supersededByDifferentComparison: boolean;
+  dismissalAttempted: boolean;
+  dismissed: boolean;
+  dismissalError?: unknown;
+}
+export interface QueuedCheckReconciliation {
+  checkRunId?: number;
+  lookupAttempted: boolean;
+  lookupError?: unknown;
+  supersededByDifferentComparison: boolean;
+  supersedeAttempted: boolean;
+  superseded: boolean;
+  supersedeError?: unknown;
+}
+interface IssueComment {
+  id: number;
+  body: string | null;
+  user?: GitHubActor | null;
+  performed_via_github_app?: { id?: number } | null;
+}
+interface ReviewSummaryOptions { preserveExistingOnClean?: boolean }
 interface PullFileResponse {
   filename: string;
   previous_filename?: string;
@@ -95,6 +141,8 @@ interface GitTreeResponse {
 }
 
 interface CodeSearchResponse {
+  total_count?: number;
+  incomplete_results?: boolean;
   items: Array<{
     path: string;
     text_matches?: Array<{ fragment?: string; matches?: Array<{ text?: string }> }>;
@@ -105,19 +153,35 @@ type ReactionContent = "+1" | "-1" | "laugh" | "confused" | "heart" | "hooray" |
 
 export class GitHubClient {
   readonly #token: string;
+  readonly #appIdentity: GitHubAppIdentity;
+  readonly #reconciliationDelay: Delay;
 
-  private constructor(token: string) {
+  private constructor(
+    token: string,
+    appIdentity: GitHubAppIdentity,
+    reconciliationDelay: Delay = delay,
+  ) {
     this.#token = token;
+    this.#appIdentity = appIdentity;
+    this.#reconciliationDelay = reconciliationDelay;
   }
 
-  static async forInstallation(appId: string, privateKey: string, installationId: number): Promise<GitHubClient> {
+  static async forInstallation(
+    appId: string,
+    privateKey: string,
+    installationId: number,
+    signal?: AbortSignal,
+  ): Promise<GitHubClient> {
     const jwt = await createAppJwt(appId, privateKey);
-    const result = await githubRequest<InstallationTokenResponse>(
-      `/app/installations/${installationId}/access_tokens`,
-      jwt,
-      { method: "POST" },
-    );
-    return new GitHubClient(result.token);
+    const [result, app] = await Promise.all([
+      githubRequest<InstallationTokenResponse>(
+        `/app/installations/${installationId}/access_tokens`,
+        jwt,
+        { method: "POST", ...signalInit(signal) },
+      ),
+      githubRequest<AuthenticatedGitHubApp>("/app", jwt, signalInit(signal)),
+    ]);
+    return new GitHubClient(result.token, authenticatedAppIdentity(appId, app));
   }
 
   getPull(job: ReviewJob, signal?: AbortSignal): Promise<PullRequestState> {
@@ -142,16 +206,22 @@ export class GitHubClient {
 
   async getPullChanges(job: ReviewJob, signal?: AbortSignal): Promise<PullChangeSet> {
     const files: PullFileChange[] = [];
-    let truncated = false;
     let diffBytes = 0;
+    let filesTruncated = false;
+    let patchesTruncated = false;
 
-    for (let page = 1; page <= 3; page++) {
+    for (let page = 1; page <= 30; page++) {
       const batch = await this.request<PullFileResponse[]>(
         `/repos/${job.owner}/${job.repo}/pulls/${job.pullNumber}/files?per_page=100&page=${page}`,
         signalInit(signal),
       );
       for (const file of batch) {
-        const patch = file.patch ?? null;
+        const sourcePatch = file.patch ?? null;
+        const patchBytes = sourcePatch === null ? 0 : new TextEncoder().encode(sourcePatch).byteLength;
+        const patch = sourcePatch !== null && diffBytes + patchBytes <= MAX_RETAINED_PATCH_BYTES
+          ? sourcePatch
+          : null;
+        if (sourcePatch !== null && patch === null) patchesTruncated = true;
         const change: PullFileChange = {
           path: file.filename,
           ...(file.previous_filename === undefined ? {} : { previousPath: file.previous_filename }),
@@ -161,13 +231,19 @@ export class GitHubClient {
           patch,
         };
         files.push(change);
-        diffBytes += patch?.length ?? 0;
+        diffBytes += patchBytes && patch !== null ? patchBytes : 0;
       }
       if (batch.length < 100) break;
-      if (page === 3) truncated = true;
+      // GitHub caps this endpoint at 3,000 files. A full final page cannot
+      // prove whether the pull request contains additional changed paths.
+      if (page === 30) filesTruncated = true;
     }
 
-    return createChangeSet(files, truncated || diffBytes > 2_000_000);
+    return createChangeSet(
+      files,
+      filesTruncated,
+      patchesTruncated || files.some((file) => file.patch === null),
+    );
   }
 
   async getRepositoryTree(
@@ -223,7 +299,7 @@ export class GitHubClient {
     pathPrefix: string | undefined,
     limit: number,
     signal?: AbortSignal,
-  ): Promise<Array<{ path: string; fragment: string }>> {
+  ): Promise<{ matches: Array<{ path: string; fragment: string }>; truncated: boolean }> {
     const literal = query.replace(/["\\\r\n]/g, " ").trim().slice(0, 100);
     if (literal.length < 2) throw new Error("search query must contain at least two characters");
     const prefix = pathPrefix?.replace(/[^A-Za-z0-9_./-]/g, "").replace(/^\/+/, "").slice(0, 200);
@@ -232,10 +308,13 @@ export class GitHubClient {
       `/search/code?q=${encodeURIComponent(q)}&per_page=${Math.max(1, Math.min(limit, 30))}`,
       { headers: { accept: "application/vnd.github.text-match+json" }, ...signalInit(signal) },
     );
-    return result.items.slice(0, limit).map((item) => ({
-      path: item.path,
-      fragment: item.text_matches?.map((match) => match.fragment ?? "").join("\n").slice(0, 2_000) ?? "",
-    }));
+    return {
+      matches: result.items.slice(0, limit).map((item) => ({
+        path: item.path,
+        fragment: item.text_matches?.map((match) => match.fragment ?? "").join("\n").slice(0, 2_000) ?? "",
+      })),
+      truncated: result.incomplete_results === true || (result.total_count ?? result.items.length) > limit,
+    };
   }
 
   async getOtherChecks(job: ReviewJob, signal?: AbortSignal): Promise<Array<Record<string, unknown>>> {
@@ -259,15 +338,15 @@ export class GitHubClient {
       }));
   }
 
-  async ensureCheckRun(job: ReviewJob): Promise<number> {
-    return this.ensureCheckRunWithStatus(job, "in_progress");
+  async ensureCheckRun(job: ReviewJob, signal?: AbortSignal): Promise<number> {
+    return this.ensureCheckRunWithStatus(job, "in_progress", signal);
   }
 
-  async ensureQueuedCheckRun(job: ReviewJob): Promise<number> {
-    return this.ensureCheckRunWithStatus(job, "queued");
+  async ensureQueuedCheckRun(job: ReviewJob, signal?: AbortSignal): Promise<number> {
+    return this.ensureCheckRunWithStatus(job, "queued", signal);
   }
 
-  startCheckRun(job: ReviewJob, checkRunId: number): Promise<unknown> {
+  startCheckRun(job: ReviewJob, checkRunId: number, signal?: AbortSignal): Promise<unknown> {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -276,6 +355,7 @@ export class GitHubClient {
         started_at: new Date().toISOString(),
         output: { title: "Reviewing pull request", summary: "Gaston is inspecting the change and repository context." },
       }),
+      ...signalInit(signal),
     });
   }
 
@@ -284,6 +364,7 @@ export class GitHubClient {
     checkRunId: number,
     title: string,
     summary: string,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
@@ -292,24 +373,24 @@ export class GitHubClient {
         status: "in_progress",
         output: { title: title.slice(0, 255), summary: summary.slice(0, 4_000) },
       }),
+      ...signalInit(signal),
     });
   }
 
-  private async ensureCheckRunWithStatus(job: ReviewJob, status: "queued" | "in_progress"): Promise<number> {
-    const externalId = reviewMarker(job);
-    const current = await this.request<CheckRunsResponse>(
-      `/repos/${job.owner}/${job.repo}/commits/${job.headSha}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}&per_page=100`,
-    );
-    const existing = current.check_runs.find((check) => (
-      check.external_id === externalId && check.status !== "completed"
-    ));
+  private async ensureCheckRunWithStatus(
+    job: ReviewJob,
+    status: "queued" | "in_progress",
+    signal?: AbortSignal,
+  ): Promise<number> {
+    const existing = await this.#findLiveCheckRun(job, signal);
     if (existing) {
       if (status === "in_progress" && existing.status !== "in_progress") {
-        await this.startCheckRun(job, existing.id);
+        await this.startCheckRun(job, existing.id, signal);
       }
       return existing.id;
     }
 
+    const externalId = checkMarker(job);
     const queued = status === "queued";
     const created = await this.request<CheckRun>(`/repos/${job.owner}/${job.repo}/check-runs`, {
       method: "POST",
@@ -324,8 +405,97 @@ export class GitHubClient {
           ? { title: "Review queued", summary: "Gaston accepted this commit and will start after any earlier review for this pull request." }
           : { title: "Reviewing pull request", summary: "Gaston is inspecting the change and repository context." },
       }),
+      ...signalInit(signal),
     });
     return created.id;
+  }
+
+  /**
+   * Resolve a queued-check POST that completed, or may have completed, after
+   * this review lost its durable lease. Check markers are execution-scoped, so
+   * a different manual request for the same comparison cannot adopt this run's
+   * check while its own POST is still in flight. Preserve a check explicitly
+   * adopted by the durable owner, but cancel checks from a confirmed stale
+   * execution even before the successor has persisted its own check ID.
+   */
+  async reconcileQueuedCheck(
+    job: ReviewJob,
+    knownCheckRunId: number | undefined,
+    desiredComparison: ReviewComparisonIdentity | undefined,
+    desiredCheckRunId = 0,
+    desiredExecutionIsCurrent?: boolean,
+  ): Promise<QueuedCheckReconciliation> {
+    const supersededByDifferentComparison = desiredComparison !== undefined
+      && !sameReviewComparison(job, desiredComparison);
+    const supersededByDifferentExecution = desiredExecutionIsCurrent === false;
+    let checkRunId = knownCheckRunId;
+    let lookupAttempted = false;
+    let lookupError: unknown;
+    let supersedeAttempted = false;
+    let superseded = false;
+    let supersedeError: unknown;
+
+    const staleOwner = supersededByDifferentComparison || supersededByDifferentExecution;
+    if (staleOwner && checkRunId === undefined) {
+      lookupAttempted = true;
+      try {
+        checkRunId = (await this.#findLiveCheckRunForReconciliation(job))?.id;
+      } catch (error) {
+        lookupError = error;
+      }
+    }
+
+    const adoptedByDesiredExecution = desiredCheckRunId > 0 && checkRunId === desiredCheckRunId;
+    const supersededDuplicateForSameComparison = desiredComparison !== undefined
+      && !supersededByDifferentComparison
+      && desiredCheckRunId > 0
+      && checkRunId !== undefined
+      && !adoptedByDesiredExecution;
+
+    if ((staleOwner || supersededDuplicateForSameComparison)
+      && checkRunId !== undefined
+      && !adoptedByDesiredExecution) {
+      supersedeAttempted = true;
+      try {
+        // Lease loss normally aborts the original request signal. This exact,
+        // marker-scoped cleanup must be able to finish independently.
+        await this.supersedeCheck(job, checkRunId);
+        superseded = true;
+      } catch (error) {
+        supersedeError = error;
+      }
+    }
+
+    return {
+      ...(checkRunId === undefined ? {} : { checkRunId }),
+      lookupAttempted,
+      ...(lookupError === undefined ? {} : { lookupError }),
+      supersededByDifferentComparison,
+      supersedeAttempted,
+      superseded,
+      ...(supersedeError === undefined ? {} : { supersedeError }),
+    };
+  }
+
+  async #findLiveCheckRunForReconciliation(job: ReviewJob): Promise<CheckRun | undefined> {
+    let check = await this.#findLiveCheckRun(job);
+    for (const delayMs of RECONCILIATION_LOOKUP_BACKOFF_MS) {
+      if (check !== undefined) return check;
+      await this.#reconciliationDelay(delayMs);
+      check = await this.#findLiveCheckRun(job);
+    }
+    return check;
+  }
+
+  async #findLiveCheckRun(job: ReviewJob, signal?: AbortSignal): Promise<CheckRun | undefined> {
+    const current = await this.request<CheckRunsResponse>(
+      `/repos/${job.owner}/${job.repo}/commits/${job.headSha}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}&per_page=100`,
+      signalInit(signal),
+    );
+    const externalId = checkMarker(job);
+    return current.check_runs.find((check) => (
+      check.external_id === externalId && check.status !== "completed"
+    ));
   }
 
   completeCheck(
@@ -334,6 +504,7 @@ export class GitHubClient {
     review: ReviewOutput,
     budget?: ReviewBudgetSnapshot,
     coverage?: EvidenceCoverage,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const findingCount = review.findings.length;
     const incomplete = coverage?.sufficient === false;
@@ -357,10 +528,11 @@ export class GitHubClient {
           ].join("\n").slice(0, 60_000),
         },
       }),
+      ...signalInit(signal),
     });
   }
 
-  failCheck(job: ReviewJob, checkRunId: number, error: unknown): Promise<unknown> {
+  failCheck(job: ReviewJob, checkRunId: number, error: unknown, signal?: AbortSignal): Promise<unknown> {
     const message = error instanceof Error ? error.message : String(error);
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
@@ -371,6 +543,7 @@ export class GitHubClient {
         conclusion: "failure",
         output: { title: "Review failed", summary: message.slice(0, 4_000) },
       }),
+      ...signalInit(signal),
     });
   }
 
@@ -379,6 +552,7 @@ export class GitHubClient {
     checkRunId: number,
     reason: string,
     budget: ReviewBudgetSnapshot,
+    signal?: AbortSignal,
   ): Promise<unknown> {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
@@ -397,10 +571,11 @@ export class GitHubClient {
           ].join("\n"),
         },
       }),
+      ...signalInit(signal),
     });
   }
 
-  supersedeCheck(job: ReviewJob, checkRunId: number): Promise<unknown> {
+  supersedeCheck(job: ReviewJob, checkRunId: number, signal?: AbortSignal): Promise<unknown> {
     return this.request(`/repos/${job.owner}/${job.repo}/check-runs/${checkRunId}`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -413,23 +588,107 @@ export class GitHubClient {
           summary: "A newer commit arrived, so Gaston stopped this review and moved to the latest cumulative pull request diff.",
         },
       }),
+      ...signalInit(signal),
     });
   }
 
-  async hasPublishedReview(job: ReviewJob, signal?: AbortSignal): Promise<boolean> {
+  async findPublishedReview(job: ReviewJob, signal?: AbortSignal): Promise<PullReview | undefined> {
     const marker = `<!-- ${reviewMarker(job)} -->`;
     for (let page = 1; page <= 10; page++) {
       const reviews = await this.request<PullReview[]>(
         `/repos/${job.owner}/${job.repo}/pulls/${job.pullNumber}/reviews?per_page=100&page=${page}`,
         signalInit(signal),
       );
-      if (reviews.some((review) => review.commit_id === job.headSha && review.body?.includes(marker))) return true;
-      if (reviews.length < 100) return false;
+      const published = reviews.find((review) => (
+        review.commit_id === job.headSha
+        && review.body?.includes(marker)
+        && isAppBot(review.user, this.#appIdentity)
+      ));
+      if (published) return published;
+      if (reviews.length < 100) return undefined;
     }
-    return false;
+    return undefined;
   }
 
-  publishReview(job: ReviewJob, review: ReviewOutput, requestChangesOn: string | undefined): Promise<unknown> {
+  async hasPublishedReview(job: ReviewJob, signal?: AbortSignal): Promise<boolean> {
+    return (await this.findPublishedReview(job, signal)) !== undefined;
+  }
+
+  /**
+   * Resolve the outcome of a review POST whose response became ambiguous after
+   * lease loss. Reconciliation deliberately does not reuse the aborted signal:
+   * the marker lookup and best-effort dismissal must be allowed to finish.
+   */
+  async reconcilePublishedReview(
+    job: ReviewJob,
+    publishedReview: unknown,
+    desiredComparison: ReviewComparisonIdentity | undefined,
+  ): Promise<PublishedReviewReconciliation> {
+    let reviewId = pullReviewId(publishedReview);
+    let lookupAttempted = false;
+    let lookupError: unknown;
+    if (reviewId === undefined) {
+      lookupAttempted = true;
+      try {
+        reviewId = pullReviewId(await this.#findPublishedReviewForReconciliation(job));
+      } catch (error) {
+        lookupError = error;
+      }
+    }
+
+    // Missing/legacy coordinator state is not proof of a different comparison.
+    const supersededByDifferentComparison = desiredComparison !== undefined
+      && !sameReviewComparison(job, desiredComparison);
+    let dismissalAttempted = false;
+    let dismissed = false;
+    let dismissalError: unknown;
+    if (reviewId !== undefined && supersededByDifferentComparison) {
+      dismissalAttempted = true;
+      try {
+        await this.dismissReview(
+          job,
+          reviewId,
+          "Gaston review dismissed because a newer review request took ownership before publication completed.",
+        );
+        dismissed = true;
+      } catch (error) {
+        dismissalError = error;
+      }
+    }
+
+    return {
+      ...(reviewId === undefined ? {} : { reviewId }),
+      lookupAttempted,
+      ...(lookupError === undefined ? {} : { lookupError }),
+      supersededByDifferentComparison,
+      dismissalAttempted,
+      dismissed,
+      ...(dismissalError === undefined ? {} : { dismissalError }),
+    };
+  }
+
+  /**
+   * GitHub can briefly omit a review from the list endpoint after accepting its
+   * POST. Keep this retry local to ambiguous-publication reconciliation: normal
+   * lookups remain single-pass, and the finite schedule bounds wait time and API
+   * traffic. No caller signal is accepted because lease loss already aborted it.
+   */
+  async #findPublishedReviewForReconciliation(job: ReviewJob): Promise<PullReview | undefined> {
+    let published = await this.findPublishedReview(job);
+    for (const delayMs of RECONCILIATION_LOOKUP_BACKOFF_MS) {
+      if (published !== undefined) return published;
+      await this.#reconciliationDelay(delayMs);
+      published = await this.findPublishedReview(job);
+    }
+    return published;
+  }
+
+  publishReview(
+    job: ReviewJob,
+    review: ReviewOutput,
+    requestChangesOn: string | undefined,
+    signal?: AbortSignal,
+  ): Promise<PullReview> {
     const comments = review.findings.map((finding) => ({
       path: finding.path,
       line: finding.line,
@@ -444,32 +703,60 @@ export class GitHubClient {
         body: `<!-- ${reviewMarker(job)} -->\n${renderSummary(review)}`,
         comments,
       }),
+      ...signalInit(signal),
     });
   }
 
-  async upsertReviewSummary(job: ReviewJob, review: ReviewOutput): Promise<void> {
+  dismissReview(
+    job: ReviewJob,
+    reviewId: number,
+    message: string,
+    signal?: AbortSignal,
+  ): Promise<PullReview> {
+    return this.request(
+      `/repos/${job.owner}/${job.repo}/pulls/${job.pullNumber}/reviews/${reviewId}/dismissals`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ message: message.slice(0, 1_000) }),
+        ...signalInit(signal),
+      },
+    );
+  }
+
+  async upsertReviewSummary(
+    job: ReviewJob,
+    review: ReviewOutput,
+    signal?: AbortSignal,
+    options: ReviewSummaryOptions = {},
+  ): Promise<void> {
     const marker = `<!-- gaston-summary:${job.pullNumber} -->`;
     let existing: IssueComment | undefined;
     for (let page = 1; page <= 10; page++) {
       const comments = await this.request<IssueComment[]>(
         `/repos/${job.owner}/${job.repo}/issues/${job.pullNumber}/comments?per_page=100&page=${page}`,
+        signalInit(signal),
       );
-      existing = comments.find((comment) => comment.body?.includes(marker));
+      existing = comments.find((comment) => (
+        comment.body?.includes(marker) && isAppIssueComment(comment, this.#appIdentity)
+      ));
       if (existing || comments.length < 100) break;
     }
     if (!existing && review.findings.length === 0) return;
+    if (existing && review.findings.length === 0 && options.preserveExistingOnClean === true) return;
 
     const body = `${marker}\n${renderSummary(review)}\n\n_Last reviewed commit: \`${job.headSha.slice(0, 12)}\`._`;
     if (existing) {
       await this.request(`/repos/${job.owner}/${job.repo}/issues/comments/${existing.id}`, {
         method: "PATCH",
         body: JSON.stringify({ body }),
+        ...signalInit(signal),
       });
       return;
     }
     await this.request(`/repos/${job.owner}/${job.repo}/issues/${job.pullNumber}/comments`, {
       method: "POST",
       body: JSON.stringify({ body }),
+      ...signalInit(signal),
     });
   }
 
@@ -516,6 +803,34 @@ export async function getGitHubAppReadiness(appId: string, privateKey: string): 
   };
 }
 
+function authenticatedAppIdentity(
+  configuredAppId: string,
+  app: AuthenticatedGitHubApp,
+): GitHubAppIdentity {
+  const expectedId = Number(configuredAppId);
+  if (!Number.isSafeInteger(expectedId) || expectedId <= 0 || app.id !== expectedId) {
+    throw new Error("GitHub returned an unexpected authenticated App identity");
+  }
+  if (typeof app.slug !== "string" || app.slug.length === 0) {
+    throw new Error("GitHub did not return the authenticated App slug");
+  }
+  return {
+    id: expectedId,
+    botLogin: `${app.slug}[bot]`.toLowerCase(),
+  };
+}
+
+function isAppBot(actor: GitHubActor | null | undefined, app: GitHubAppIdentity): boolean {
+  return actor?.type?.toLowerCase() === "bot"
+    && actor.login?.toLowerCase() === app.botLogin;
+}
+
+function isAppIssueComment(comment: IssueComment, app: GitHubAppIdentity): boolean {
+  if (!isAppBot(comment.user, app)) return false;
+  const attributedAppId = comment.performed_via_github_app?.id;
+  return attributedAppId === undefined || attributedAppId === app.id;
+}
+
 function hasPermission(actual: string | undefined, required: "read" | "write"): boolean {
   if (required === "read") return actual === "read" || actual === "write" || actual === "admin";
   return actual === "write" || actual === "admin";
@@ -560,6 +875,25 @@ function reviewMarker(job: ReviewJob): string {
   return `gaston-review:${job.pullNumber}:${job.baseSha}:${job.headSha}`;
 }
 
+/**
+ * Check runs are unique per executable request, while published review
+ * comments intentionally remain unique per base/head comparison. Automatic
+ * redeliveries share an execution; each manual command starts a fresh one. */
+function checkMarker(job: ReviewJob): string {
+  const execution = job.trigger === "manual" ? `manual:${job.deliveryId}` : "automatic";
+  return `${reviewMarker(job)}:${execution}`;
+}
+
+function sameReviewComparison(job: ReviewJob, desired: ReviewComparisonIdentity): boolean {
+  return desired.baseSha === job.baseSha && desired.headSha === job.headSha;
+}
+
+function pullReviewId(value: unknown): number | undefined {
+  if (typeof value !== "object" || value === null || !("id" in value)) return undefined;
+  const id = (value as { id?: unknown }).id;
+  return typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? id : undefined;
+}
+
 function checkDetails(job: ReviewJob): { details_url?: string } {
   if (!job.dashboardUrl) return {};
   try {
@@ -587,7 +921,7 @@ function renderSummary(review: ReviewOutput): string {
       lines.push(`- **${finding.severity.toUpperCase()}** \`${finding.path}:${finding.line}\` — ${finding.title}`);
     }
   }
-  lines.push("", "_Generated by Gaston's Computer-backed harness with DeepSeek V4 Flash; only independently verified, changed-line findings are shown._");
+  lines.push("", "_Generated by Gaston's Computer-backed harness; only independently verified, changed-line findings are shown._");
   return lines.join("\n").slice(0, 60_000);
 }
 
@@ -645,7 +979,10 @@ async function githubRawRequest(path: string, token: string, init: RequestInit =
   return response;
 }
 
-function renderUnifiedDiff(files: PullFileChange[], maxBytes: number): string {
+function renderUnifiedDiff(
+  files: PullFileChange[],
+  maxBytes: number,
+): { diff: string; truncated: boolean } {
   let result = "";
   for (const file of files) {
     if (!file.patch) continue;
@@ -658,17 +995,26 @@ function renderUnifiedDiff(files: PullFileChange[], maxBytes: number): string {
       file.patch,
       "",
     ].join("\n");
-    if (result.length + block.length > maxBytes) break;
+    if (result.length + block.length > maxBytes) return { diff: result, truncated: true };
     result += block;
   }
-  return result;
+  return { diff: result, truncated: false };
 }
 
-function createChangeSet(files: PullFileChange[], truncated: boolean): PullChangeSet {
+function createChangeSet(
+  files: PullFileChange[],
+  filesTruncated: boolean,
+  diffTruncated: boolean,
+): PullChangeSet {
+  const rendered = renderUnifiedDiff(files, 2_000_000);
+  const aggregateTruncated = diffTruncated || rendered.truncated;
   return {
     files,
-    diff: renderUnifiedDiff(files, 2_000_000),
-    truncated,
+    diff: rendered.diff,
+    truncated: filesTruncated || aggregateTruncated,
+    filesTruncated,
+    diffTruncated: aggregateTruncated,
+    unavailablePatchPaths: files.filter((file) => file.patch === null).map((file) => file.path),
   };
 }
 
@@ -755,4 +1101,8 @@ function base64Url(bytes: Uint8Array): string {
     binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
   }
   return btoa(binary).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+}
+
+function delay(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
 }
