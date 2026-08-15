@@ -1,10 +1,24 @@
 import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-import { ReviewAgent } from "../src/agent.ts";
+import {
+  DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST,
+  ReviewAgent,
+} from "../src/agent.ts";
 import { ReviewBudget, type ReviewBudgetLimits } from "../src/budget.ts";
-import type { EvidenceCoverage, EvidenceResult, EvidenceTools } from "../src/evidence.ts";
+import { pinnedDependencySource } from "../src/dependency-evidence.ts";
+import {
+  emptyEvidenceCoverage,
+  type EvidenceCoverage,
+  type EvidenceResult,
+  type EvidenceTools,
+} from "../src/evidence.ts";
 import { GitHubApiError } from "../src/github.ts";
-import { discoveryPrompt, REVIEW_LENS, verificationPrompt } from "../src/prompts.ts";
+import { discoveryPrompt, REVIEW_LENS } from "../src/prompts.ts";
+import {
+  RepositorySnapshot,
+  type RepositorySnapshotFilesystem,
+} from "../src/repository-snapshot.ts";
 import {
   aggregateRecentPrScores,
   scoreRecentPrCase,
@@ -20,11 +34,8 @@ import {
 } from "../src/repository.ts";
 import {
   filterFindings,
-  finalizeVerificationPublication,
   parseChangedFileLines,
-  resolveVerificationVerdicts,
   shouldUseDirectDiscovery,
-  tagVerificationCandidates,
 } from "../src/review-core.ts";
 import type {
   PullChangeSet,
@@ -34,12 +45,12 @@ import type {
   ReviewJob,
   ReviewOutput,
 } from "../src/types.ts";
-import {
-  prefetchVerificationAnchors,
-  withOpaqueEvidenceHandles,
-} from "../src/verification-evidence.ts";
+import { verifyAndPublish } from "../src/verification-pipeline.ts";
 
-const corpusUrl = new URL("../benchmarks/recent-bot-prs.json", import.meta.url);
+const corpusPath = option("--corpus");
+const corpusUrl = corpusPath === undefined
+  ? new URL("../benchmarks/recent-bot-prs.json", import.meta.url)
+  : pathToFileURL(resolve(corpusPath));
 const corpus = await Bun.file(corpusUrl).json() as RecentPrBenchCorpus;
 const mode = process.argv.includes("--run") ? "run" : "validate";
 const selection = option("--case") ?? "all";
@@ -49,12 +60,22 @@ const effort = effortOption(option("--effort") ?? "max");
 const structuredOutputMode = structuredOutputOption(option("--structured-output") ?? "json_schema");
 const allowDataCollection = process.argv.includes("--allow-data-collection");
 const maxCostUsd = numberOption("--max-cost-usd", 0.25, 0.001, 5);
+const verificationClusterSize = option("--verification-cluster-size") === undefined
+  ? undefined
+  : numberOption("--verification-cluster-size", 1, 1, 12);
 const outputPath = option("--output");
-const selectedCases = selection === "all"
+const discoveryArtifactPath = option("--discovery-artifact");
+const seededDiscovery = discoveryArtifactPath === undefined
+  ? undefined
+  : await loadSeededDiscoveries(discoveryArtifactPath);
+const selectableCases = seededDiscovery === undefined
   ? corpus.cases
-  : corpus.cases.filter((fixture) => fixture.id === selection);
+  : corpus.cases.filter((fixture) => seededDiscovery.reviews.has(fixture.id));
+const selectedCases = selection === "all"
+  ? selectableCases
+  : selectableCases.filter((fixture) => fixture.id === selection);
 if (selectedCases.length === 0) {
-  throw new Error(`unknown case ${selection}; expected all or ${corpus.cases.map((entry) => entry.id).join(", ")}`);
+  throw new Error(`unknown case ${selection}; expected all or ${selectableCases.map((entry) => entry.id).join(", ")}`);
 }
 
 interface CompareResponse {
@@ -123,7 +144,7 @@ async function main(): Promise<void> {
   }
 
   const apiKey = await openRouterKey();
-  const fingerprint = await harnessFingerprint();
+  const fingerprint = await harnessFingerprint(corpusUrl);
   const results = [];
   for (const snapshot of prepared) {
     process.stderr.write(`[bench] ${model} ${snapshot.fixture.id}\n`);
@@ -136,7 +157,9 @@ async function main(): Promise<void> {
         structuredOutputMode,
         allowDataCollection,
         maxCostUsd,
+        verificationClusterSize,
         fingerprint,
+        seededDiscovery: seededDiscovery?.reviews.get(snapshot.fixture.id),
       }));
     } catch (error) {
       const failure = error instanceof BenchCaseFailure ? error : undefined;
@@ -158,7 +181,7 @@ async function main(): Promise<void> {
       });
     }
   }
-  const completedFingerprint = await harnessFingerprint();
+  const completedFingerprint = await harnessFingerprint(corpusUrl);
   const fingerprintStable = completedFingerprint === fingerprint;
   const metrics = aggregateRecentPrScores(results.map((entry) => ({
     score: entry.score,
@@ -186,6 +209,7 @@ async function main(): Promise<void> {
       structuredOutputMode,
       allowDataCollection,
       maxCostUsdPerCase: maxCostUsd,
+      verificationClusterSize,
       directDiscoveryWhenComplete: true,
       maxExplorationTurns: 1,
       minimumConfidence: 0.8,
@@ -194,6 +218,11 @@ async function main(): Promise<void> {
       completedHarnessFingerprint: completedFingerprint,
       fingerprintStable,
       repositoryPolicyMode: "omitted-exact-base-policy-not-loaded",
+      ...(seededDiscovery === undefined ? {} : {
+        discoveryMode: "seeded-artifact",
+        discoveryArtifactSha256: seededDiscovery.sha256,
+        discoveryModel: seededDiscovery.model,
+      }),
     },
     metrics,
     discoveryMetrics,
@@ -232,6 +261,7 @@ async function prepareSnapshot(github: PublicGitHub, fixture: RecentPrBenchCase)
     trigger: "manual",
   };
   const backend = new SnapshotRepositoryBackend(github, job, changes);
+  await backend.initialize();
   const policy = await loadReviewPolicy(backend, changes);
   return { fixture, compare, changes, job, backend, policy };
 }
@@ -245,7 +275,14 @@ function validateSnapshot(snapshot: Awaited<ReturnType<typeof prepareSnapshot>>)
   if (compare.status !== "ahead" || compare.behind_by !== 0 || compare.merge_base_commit.sha !== fixture.baseSha) {
     failures.push(`${fixture.id}: base/head is not an exact forward comparison`);
   }
-  if (compare.total_commits !== 1) failures.push(`${fixture.id}: expected a one-commit reviewed snapshot`);
+  const expectedCommitCount = fixture.expectedCommitCount ?? 1;
+  if (!Number.isSafeInteger(expectedCommitCount) || expectedCommitCount < 1) {
+    failures.push(`${fixture.id}: expectedCommitCount must be a positive integer`);
+  } else if (compare.total_commits !== expectedCommitCount) {
+    failures.push(
+      `${fixture.id}: expected ${expectedCommitCount} commits in reviewed snapshot, got ${compare.total_commits}`,
+    );
+  }
   if (changes.files.length === 0) failures.push(`${fixture.id}: comparison contains no changed files`);
   if (changes.filesTruncated) failures.push(`${fixture.id}: comparison hit GitHub's 300-file compare ceiling`);
   const changed = parseChangedFileLines(changes.files);
@@ -270,14 +307,19 @@ async function runCase(
     structuredOutputMode: "json_schema" | "json_object";
     allowDataCollection: boolean;
     maxCostUsd: number;
+    verificationClusterSize?: number;
     fingerprint: string;
+    seededDiscovery?: {
+      review: ReviewOutput;
+      coverage?: EvidenceCoverage;
+    };
   },
 ) {
   const trace: ToolTraceEntry[] = [];
   const limits: ReviewBudgetLimits = {
     maxWallTimeMs: 14 * 60_000,
     modelRequestTimeoutMs: 11 * 60_000,
-    maxModelRequests: 9,
+    maxModelRequests: 15,
     maxEstimatedInputTokens: 250_000,
     maxOutputTokens: 128_000,
     maxCostUsd: config.maxCostUsd,
@@ -299,61 +341,96 @@ async function runCase(
     structuredOutputMode: config.structuredOutputMode,
     allowDataCollection: config.allowDataCollection,
     });
+    const verificationAgent = new ReviewAgent({
+      apiKey: config.apiKey,
+      model: config.model,
+      reasoningEffort: config.effort,
+      repository: snapshot.fixture.repository,
+      budget,
+      maxOutputTokensPerRequest: DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST,
+      requireInitialToolCall: false,
+      maxExplorationTurns: 1,
+      provider: config.provider,
+      requireZdr: false,
+      structuredOutputMode: config.structuredOutputMode,
+      allowDataCollection: config.allowDataCollection,
+    });
+    const verificationRescueAgent = new ReviewAgent({
+      apiKey: config.apiKey,
+      model: config.model,
+      reasoningEffort: config.effort,
+      repository: snapshot.fixture.repository,
+      budget,
+      maxOutputTokensPerRequest: DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST,
+      requireInitialToolCall: false,
+      maxExplorationTurns: 2,
+      provider: config.provider,
+      requireZdr: false,
+      structuredOutputMode: config.structuredOutputMode,
+      allowDataCollection: config.allowDataCollection,
+    });
     const changedLines = parseChangedFileLines(snapshot.changes.files);
-  const discoveryTools = new TracedEvidenceTools(snapshot.backend, "discovery", trace);
-  const directDiscovery = shouldUseDirectDiscovery("true", discoveryTools.coverage());
+  const discoveryTools = config.seededDiscovery === undefined
+    ? new TracedEvidenceTools(snapshot.backend, "discovery", trace)
+    : undefined;
+  const directDiscovery = config.seededDiscovery !== undefined
+    || shouldUseDirectDiscovery("true", discoveryTools!.coverage());
   const discovery = filterFindings(
-    directDiscovery
-      ? await agent.runDirectReview(
-          discoveryPrompt(snapshot.job, snapshot.changes, [], snapshot.policy, REVIEW_LENS),
-          "discovery",
-        )
-      : await agent.run(
-          discoveryPrompt(snapshot.job, snapshot.changes, [], snapshot.policy, REVIEW_LENS),
-          discoveryTools,
-          "discovery",
-        ),
+    config.seededDiscovery?.review
+      ?? (directDiscovery
+        ? await agent.runDirectReview(
+            discoveryPrompt(snapshot.job, snapshot.changes, [], snapshot.policy, REVIEW_LENS),
+            "discovery",
+          )
+        : await agent.run(
+            discoveryPrompt(snapshot.job, snapshot.changes, [], snapshot.policy, REVIEW_LENS),
+            discoveryTools!,
+            "discovery",
+          )),
     changedLines,
     0,
     12,
   );
-  const discoveryCoverage = discoveryTools.coverage();
+  const discoveryCoverage = config.seededDiscovery?.coverage
+    ?? (discoveryTools?.coverage() ?? seededDiscoveryCoverage(snapshot.changes.files.length));
   let output: ReviewOutput = discovery;
   let finalCoverage = discoveryCoverage;
   let verification: unknown;
   if (discovery.findings.length > 0) {
-    const candidates = tagVerificationCandidates([discovery]);
-    const verificationTools = withOpaqueEvidenceHandles(
-      new TracedEvidenceTools(snapshot.backend, "verification", trace),
-    );
-    const anchors = await prefetchVerificationAnchors(candidates, verificationTools, budget.signal);
-    const raw = await agent.runVerification(
-      verificationPrompt(
-        snapshot.job,
-        [{ source: directDiscovery ? "direct-discovery" : "discovery", review: candidates[0]! }],
-        snapshot.changes,
-        snapshot.policy,
-        anchors,
-      ),
-      verificationTools,
-    );
-    const verificationCoverage = verificationTools.coverage();
-    const resolved = resolveVerificationVerdicts(raw, candidates, verificationCoverage);
-    const finalized = finalizeVerificationPublication(resolved, {
+    const finalized = await verifyAndPublish({
+      runner: verificationAgent,
+      rescueRunner: verificationRescueAgent,
+      tools: new TracedEvidenceTools(snapshot.backend, "verification", trace),
+      job: snapshot.job,
+      discoveries: [{
+        source: config.seededDiscovery !== undefined
+          ? "seeded-discovery"
+          : directDiscovery ? "direct-discovery" : "discovery",
+        review: discovery,
+      }],
+      changes: snapshot.changes,
+      policy: snapshot.policy,
+      signal: budget.signal,
       changedLines,
       discoveryCoverage,
-      verificationCoverage,
       configuredBaseThreshold: "0.80",
       configuredIncompleteEvidenceFloor: "0.88",
       maxFindings: 8,
+      ...(config.verificationClusterSize === undefined
+        ? {}
+        : { verificationClusterSize: config.verificationClusterSize }),
     });
     output = finalized.review;
     finalCoverage = finalized.coverage;
     verification = {
-      raw,
+      raw: finalized.raw,
+      initialRaw: finalized.initialRaw,
       resolution: finalized.resolution,
-      coverage: verificationCoverage,
+      coverage: finalized.verificationCoverage,
       publicationMinConfidence: finalized.minConfidence,
+      rescue: finalized.rescue,
+      rescueDecision: finalized.rescueDecision,
+      clusters: finalized.clusters,
     };
   }
   const budgetSnapshot = budget.snapshot();
@@ -371,6 +448,7 @@ async function runCase(
     },
     directDiscovery,
     discovery,
+    discoveryCoverage,
     ...(verification === undefined ? {} : { verification }),
     output,
     discoveryScore: scoreRecentPrCase(snapshot.fixture, discovery),
@@ -424,6 +502,7 @@ class SnapshotRepositoryBackend {
   readonly changes: PullChangeSet;
   readonly #github: PublicGitHub;
   readonly #job: ReviewJob;
+  readonly #snapshot: RepositorySnapshot;
   #treeByRef = new Map<string, Promise<{ entries: RepositoryEntry[]; truncated: boolean }>>();
   #fileByRef = new Map<string, Promise<string>>();
 
@@ -431,6 +510,18 @@ class SnapshotRepositoryBackend {
     this.#github = github;
     this.#job = job;
     this.changes = changes;
+    this.#snapshot = new RepositorySnapshot({
+      fs: new MemorySnapshotFilesystem(),
+      ref: job.headSha,
+      cacheRoot: "/bench",
+      loadArchive: (signal) => github.repositoryArchive(job, job.headSha, signal),
+      loadInventory: (signal) => github.repositoryTree(job, job.headSha, signal),
+      loadControlFile: (path, signal) => github.readFile(job, path, job.headSha, signal),
+    });
+  }
+
+  async initialize(): Promise<void> {
+    await this.#snapshot.ensure();
   }
 
   changedFiles(offset = 0, limit = 100): string {
@@ -446,7 +537,8 @@ class SnapshotRepositoryBackend {
   }
 
   async tree(prefix: string, limit: number, signal?: AbortSignal): Promise<string> {
-    const { entries, truncated } = await this.repositoryTree(this.#job.headSha, signal);
+    const { entries, truncated } = await this.#snapshot.tree()
+      ?? await this.repositoryTree(this.#job.headSha, signal);
     const normalized = prefix.trim().replace(/^\/+|\/+$/g, "");
     const selected = entries.filter((entry) => (
       !normalized || entry.path === normalized || entry.path.startsWith(`${normalized}/`)
@@ -476,6 +568,8 @@ class SnapshotRepositoryBackend {
   }
 
   async search(query: string, pathPrefix: string | undefined, limit: number, signal?: AbortSignal): Promise<string> {
+    const local = await this.#snapshot.search(query, pathPrefix, limit, signal);
+    if (local !== undefined) return renderSearchResults(local.matches, local.truncated);
     const candidates = await this.#github.searchPaths(this.#job, query, pathPrefix, limit * 3, signal);
     const matches: Array<{ path: string; line: number; fragment: string }> = [];
     const needle = query.toLowerCase();
@@ -497,6 +591,27 @@ class SnapshotRepositoryBackend {
     return renderSearchResults(matches, candidates.length >= limit * 3 || matches.length >= limit);
   }
 
+  async dependencySource(
+    packageName: string,
+    query: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return pinnedDependencySource({
+      packageName,
+      query,
+      limit,
+      readHeadFile: (path, readSignal) => this.#github.readFile(
+        this.#job,
+        path,
+        this.#job.headSha,
+        readSignal,
+        2_000_000,
+      ),
+      ...(signal === undefined ? {} : { signal }),
+    });
+  }
+
   repositoryTree(ref: string, signal?: AbortSignal) {
     const cached = this.#treeByRef.get(ref);
     if (cached) return cached;
@@ -506,6 +621,15 @@ class SnapshotRepositoryBackend {
   }
 
   readExact(path: string, ref: RepositoryRef, signal?: AbortSignal): Promise<string> {
+    if (ref === "head") {
+      return this.#snapshot.read(path).then((content) => (
+        content === undefined ? this.#readExactFromGitHub(path, ref, signal) : content
+      ));
+    }
+    return this.#readExactFromGitHub(path, ref, signal);
+  }
+
+  #readExactFromGitHub(path: string, ref: RepositoryRef, signal?: AbortSignal): Promise<string> {
     const sha = ref === "base" ? this.#job.baseSha : this.#job.headSha;
     const key = `${sha}:${path}`;
     const cached = this.#fileByRef.get(key);
@@ -545,14 +669,33 @@ class PublicGitHub {
     };
   }
 
-  async readFile(job: ReviewJob, path: string, ref: string, signal?: AbortSignal): Promise<string> {
+  async repositoryArchive(job: ReviewJob, ref: string, signal?: AbortSignal) {
+    const response = await this.request(
+      `/repos/${job.owner}/${job.repo}/tarball/${encodeURIComponent(ref)}`,
+      { redirect: "follow", signal },
+    );
+    if (response.body === null) throw new Error("GitHub repository archive has no body");
+    const declared = Number(response.headers.get("content-length"));
+    return {
+      body: response.body,
+      ...(Number.isFinite(declared) && declared >= 0 ? { contentLength: declared } : {}),
+    };
+  }
+
+  async readFile(
+    job: ReviewJob,
+    path: string,
+    ref: string,
+    signal?: AbortSignal,
+    maxBytes = 400_000,
+  ): Promise<string> {
     const encoded = path.split("/").map(encodeURIComponent).join("/");
     const response = await this.request(
       `/repos/${job.owner}/${job.repo}/contents/${encoded}?ref=${ref}`,
       { headers: { accept: "application/vnd.github.raw+json" }, signal },
     );
     const text = await response.text();
-    if (byteLength(text) > 400_000) throw new Error(`file ${path} exceeds the 400000-byte read limit`);
+    if (byteLength(text) > maxBytes) throw new Error(`file ${path} exceeds the ${maxBytes}-byte read limit`);
     if (text.includes("\0")) throw new Error(`file ${path} is binary`);
     return text;
   }
@@ -588,6 +731,36 @@ class PublicGitHub {
     if (response.ok) return response;
     const detail = (await response.text()).slice(0, 1_000);
     throw new GitHubApiError(init.method ?? "GET", path, response.status, detail);
+  }
+}
+
+class MemorySnapshotFilesystem implements RepositorySnapshotFilesystem {
+  readonly #files = new Map<string, Uint8Array>();
+
+  async readFile(path: string, _encoding: "utf8"): Promise<string> {
+    const content = this.#files.get(path);
+    if (content === undefined) throw new Error(`snapshot file does not exist: ${path}`);
+    return new TextDecoder().decode(content);
+  }
+
+  async writeFile(path: string, content: string | Uint8Array): Promise<void> {
+    this.#files.set(
+      path,
+      typeof content === "string" ? new TextEncoder().encode(content) : new Uint8Array(content),
+    );
+  }
+
+  async mkdir(_path: string, _options: { recursive: true }): Promise<void> {}
+
+  async rm(path: string, _options: { recursive: true; force: true }): Promise<void> {
+    for (const candidate of this.#files.keys()) {
+      if (candidate === path || candidate.startsWith(`${path}/`)) this.#files.delete(candidate);
+    }
+  }
+
+  async stat(path: string): Promise<unknown> {
+    if (!this.#files.has(path)) throw new Error(`snapshot file does not exist: ${path}`);
+    return {};
   }
 }
 
@@ -629,20 +802,24 @@ function createChangeSet(files: PullFileChange[], filesTruncated: boolean, diffT
   };
 }
 
-async function harnessFingerprint(): Promise<string> {
+async function harnessFingerprint(activeCorpusUrl: URL): Promise<string> {
   const paths = [
     "src/agent.ts",
+    "src/dependency-evidence.ts",
     "src/evidence.ts",
     "src/prompts.ts",
     "src/repository.ts",
+    "src/repository-snapshot.ts",
     "src/review-core.ts",
+    "src/types.ts",
     "src/verification-evidence.ts",
+    "src/verification-pipeline.ts",
     "src/recent-pr-bench.ts",
     "tools/run-recent-pr-bench.ts",
-    "benchmarks/recent-bot-prs.json",
   ];
   const chunks = [];
   for (const path of paths) chunks.push(path, "\0", await Bun.file(resolve(path)).text(), "\0");
+  chunks.push("active-corpus", "\0", await Bun.file(activeCorpusUrl).text(), "\0");
   return digest(chunks.join(""));
 }
 
@@ -656,9 +833,11 @@ async function githubToken(): Promise<string> {
 async function openRouterKey(): Promise<string> {
   if (process.env.OPENROUTER_API_KEY?.trim()) return process.env.OPENROUTER_API_KEY.trim();
   const env = await Bun.file(new URL("../.env", import.meta.url)).text();
-  const match = env.match(/^OPENROUTER_API_KEY=(.+)$/m);
-  if (!match?.[1]) throw new Error("OPENROUTER_API_KEY is not configured");
-  return match[1].trim();
+  const prefix = "OPENROUTER_API_KEY=";
+  const assignment = env.split(/\r?\n/).find((line) => line.startsWith(prefix));
+  const value = assignment?.slice(prefix.length).trim();
+  if (!value) throw new Error("OPENROUTER_API_KEY is not configured");
+  return value;
 }
 
 function splitRepository(repository: string): [string, string] {
@@ -670,6 +849,64 @@ function splitRepository(repository: string): [string, string] {
 function option(name: string): string | undefined {
   const index = process.argv.indexOf(name);
   return index === -1 ? undefined : process.argv[index + 1];
+}
+
+interface SeededDiscoveryArtifact {
+  sha256: string;
+  model: string | undefined;
+  reviews: Map<string, { review: ReviewOutput; coverage?: EvidenceCoverage }>;
+}
+
+async function loadSeededDiscoveries(path: string): Promise<SeededDiscoveryArtifact> {
+  const content = await Bun.file(path).text();
+  const parsed = JSON.parse(content) as unknown;
+  if (!isRecord(parsed) || !Array.isArray(parsed.results)) {
+    throw new Error("discovery artifact must contain a results array");
+  }
+  const reviews = new Map<string, { review: ReviewOutput; coverage?: EvidenceCoverage }>();
+  for (const result of parsed.results) {
+    if (!isRecord(result) || typeof result.case !== "string" || !isReviewOutput(result.discovery)) {
+      continue;
+    }
+    reviews.set(result.case, {
+      review: result.discovery,
+      ...(isEvidenceCoverage(result.discoveryCoverage)
+        ? { coverage: result.discoveryCoverage }
+        : {}),
+    });
+  }
+  if (reviews.size === 0) throw new Error("discovery artifact contains no reusable discoveries");
+  const configuration = isRecord(parsed.configuration) ? parsed.configuration : undefined;
+  return {
+    sha256: await digest(content),
+    model: typeof configuration?.model === "string" ? configuration.model : undefined,
+    reviews,
+  };
+}
+
+function seededDiscoveryCoverage(totalChangedFiles: number): EvidenceCoverage {
+  const coverage = emptyEvidenceCoverage(totalChangedFiles);
+  return {
+    ...coverage,
+    sufficient: false,
+    limitations: ["Discovery evidence coverage was unavailable in the seeded artifact."],
+  };
+}
+
+function isReviewOutput(value: unknown): value is ReviewOutput {
+  return isRecord(value)
+    && typeof value.summary === "string"
+    && Array.isArray(value.findings);
+}
+
+function isEvidenceCoverage(value: unknown): value is EvidenceCoverage {
+  return isRecord(value)
+    && typeof value.sufficient === "boolean"
+    && Array.isArray(value.limitations);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function effortOption(value: string): "high" | "xhigh" | "max" {

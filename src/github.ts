@@ -6,6 +6,7 @@ import type {
   ReviewJob,
   ReviewOutput,
 } from "./types.ts";
+import type { RepositoryArchive } from "./repository-snapshot.ts";
 import { formatBudgetSummary, type ReviewBudgetSnapshot } from "./budget.ts";
 import type { EvidenceCoverage } from "./evidence.ts";
 import { shouldRequestChanges } from "./review-core.ts";
@@ -267,6 +268,34 @@ export class GitHubClient {
           size: entry.size ?? null,
         })),
       truncated: tree.truncated || tree.tree.length > 100_000,
+    };
+  }
+
+  /** Open GitHub's immutable, history-free archive for one exact commit. */
+  async getRepositoryArchive(
+    job: ReviewJob,
+    ref: string,
+    signal?: AbortSignal,
+  ): Promise<RepositoryArchive> {
+    const requestPath = `/repos/${job.owner}/${job.repo}/tarball/${encodeURIComponent(ref)}`;
+    const response = await this.rawRequest(requestPath, {
+      redirect: "follow",
+      ...signalInit(signal),
+    });
+    const finalUrl = response.url ? new URL(response.url) : undefined;
+    if (finalUrl !== undefined && (
+      finalUrl.protocol !== "https:"
+      || (finalUrl.hostname !== "api.github.com" && finalUrl.hostname !== "codeload.github.com")
+    )) {
+      throw new GitHubApiError("GET", requestPath, 502, "archive redirected to an unexpected host");
+    }
+    if (response.body === null) {
+      throw new GitHubApiError("GET", requestPath, 502, "archive response has no body");
+    }
+    const declared = Number(response.headers.get("content-length"));
+    return {
+      body: response.body,
+      ...(Number.isFinite(declared) && declared >= 0 ? { contentLength: declared } : {}),
     };
   }
 

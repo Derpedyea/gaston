@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "configuration": {
+    "model": "harness-authored-positive-negative-calibration"
+  },
+  "results": [
+    {
+      "case": "t3code-bare-padding-regression",
+      "discovery": {
+        "summary": "One known positive and one minimally related negative control for verifier calibration.",
+        "findings": [
+          {
+            "path": "apps/web/src/routes/-chatIndexTitlebar.test.ts",
+            "line": 18,
+            "side": "RIGHT",
+            "severity": "low",
+            "title": "Regression test misses unprefixed mobile py-* classes",
+            "why": "If the header later regains a whitespace-delimited py-2 class, the new assertion passes because its expression only recognizes py- at the slice start or after a colon.",
+            "evidence": "The replaced class string contained whitespace-prefixed py-2, while the new expression is /(?:^|:)py-/.",
+            "suggestedFix": "Match a class-token boundary before py-*.",
+            "confidence": 0.99
+          },
+          {
+            "path": "apps/web/src/routes/-chatIndexTitlebar.test.ts",
+            "line": 18,
+            "side": "RIGHT",
+            "severity": "low",
+            "title": "Class names containing py- inside a word trip the padding assertion",
+            "why": "A harmless class such as copy-muted contains the characters py-, so the added expression allegedly rejects it and fails CI.",
+            "evidence": "The assertion searches the extracted header source for py-.",
+            "suggestedFix": "Require py- to begin a complete utility token.",
+            "confidence": 0.85
+          }
+        ]
+      },
+      "calibrationExpected": [
+        {
+          "candidateId": "GASTON-CANDIDATE-1",
+          "verification": "confirmed",
+          "publication": "published"
+        },
+        {
+          "candidateId": "GASTON-CANDIDATE-2",
+          "verification": "refuted",
+          "publication": "not_applicable"
+        }
+      ]
+    }
+  ]
+}

@@ -1762,6 +1762,8 @@ describe("ReviewAgent", () => {
               evidence: "read_file returned a permanent error",
               evidenceComplete: false,
               evidenceScopes: [],
+              missingEvidenceKind: "tool_failure",
+              missingEvidence: "Whether the base file can be retrieved successfully.",
             }],
           }) } }] });
     }));

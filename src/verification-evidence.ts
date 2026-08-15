@@ -1,36 +1,45 @@
 import type { EvidenceCoverage, EvidenceResult, EvidenceTools } from "./evidence.ts";
 import type { VerificationAnchorEvidence } from "./prompts.ts";
+import { verificationCandidateId } from "./review-core.ts";
 import type { ReviewOutput } from "./types.ts";
 
 const EVIDENCE_HANDLE_PREFIX = "GASTON-EVIDENCE";
-
-interface IncompleteRead {
-  handle: string;
-  path: string;
-  ref: "base" | "head";
-  startLine: number;
-  endLine: number;
-}
+const OBSERVATION_HANDLE_PREFIX = "GASTON-OBSERVATION";
 
 /**
  * Keep repository paths and ranges in the harness-owned ledger while exposing
- * only short, opaque evidence identities to the verifier. This removes exact
- * string transcription from the trust boundary. A successful narrow read can
- * also supersede an earlier truncated read of the same file range; the broad
- * handle remains auditable, but no longer poisons an otherwise complete proof.
+ * only short, opaque identities to the verifier. Complete results receive
+ * citable proof handles; partial and failed results receive non-citable
+ * observation handles. Recovery always creates a new proof handle instead of
+ * promoting an observation whose full contents were never returned.
  */
 export function withOpaqueEvidenceHandles(
   tools: EvidenceTools,
-): EvidenceTools & { coverage(): EvidenceCoverage } {
+): OpaqueEvidenceTools {
   return new OpaqueVerificationEvidenceTools(tools);
+}
+
+export interface VerificationEvidenceDossierEntry {
+  handle: string;
+  tool: string;
+  arguments: unknown;
+  content: string;
+}
+
+export interface OpaqueEvidenceTools extends EvidenceTools {
+  coverage(): EvidenceCoverage;
+  dossier(handles: readonly string[], maxBytes?: number): VerificationEvidenceDossierEntry[];
+  toolAvailability(name: string): "untried" | "succeeded" | "failed";
 }
 
 class OpaqueVerificationEvidenceTools implements EvidenceTools {
   readonly #inner: EvidenceTools;
-  readonly #handles = new Map<string, string>();
-  readonly #incompleteReads = new Map<string, IncompleteRead>();
-  readonly #supersededHandles = new Set<string>();
-  #nextHandle = 1;
+  readonly #proofHandles = new Map<string, string>();
+  readonly #observationHandles = new Map<string, string>();
+  readonly #dossier = new Map<string, VerificationEvidenceDossierEntry>();
+  readonly #toolStatuses = new Map<string, Set<EvidenceResult["status"]>>();
+  #nextProofHandle = 1;
+  #nextObservationHandle = 1;
 
   constructor(inner: EvidenceTools) {
     this.#inner = inner;
@@ -38,39 +47,54 @@ class OpaqueVerificationEvidenceTools implements EvidenceTools {
 
   async invoke(name: string, rawArguments: string, signal?: AbortSignal): Promise<EvidenceResult> {
     const result = await this.#inner.invoke(name, rawArguments, signal);
+    const statuses = this.#toolStatuses.get(name) ?? new Set();
+    statuses.add(result.status);
+    this.#toolStatuses.set(name, statuses);
     if (result.evidence === undefined) return result;
 
     const rawScope = result.evidence.scope;
-    const handle = this.#handle(rawScope);
+    const complete = result.status === "ok" && result.evidence.complete === true;
+    const handle = complete ? this.#proofHandle(rawScope) : this.#observationHandle(rawScope);
     const rawResolutionScope = result.evidence.resolutionScope;
-    const read = name === "read_file" ? readIdentity(rawArguments) : undefined;
-    if (read !== undefined) {
-      if (result.status === "ok" && result.evidence.complete === true) {
-        for (const incomplete of this.#incompleteReads.values()) {
-          if (
-            incomplete.path === read.path
-            && incomplete.ref === read.ref
-            && read.startLine >= incomplete.startLine
-            && read.endLine <= incomplete.endLine
-          ) {
-            this.#supersededHandles.add(incomplete.handle);
-          }
-        }
-      } else {
-        this.#incompleteReads.set(handle, { handle, ...read });
-      }
-    }
 
-    return {
+    const mapped = {
       ...result,
       evidence: {
         ...result.evidence,
         scope: handle,
         ...(rawResolutionScope === undefined
           ? {}
-          : { resolutionScope: this.#handle(rawResolutionScope) }),
+          : { resolutionScope: this.#observationHandle(rawResolutionScope) }),
       },
     };
+    if (complete) {
+      this.#dossier.set(handle, {
+        handle,
+        tool: name,
+        arguments: safeArguments(rawArguments),
+        content: result.content,
+      });
+    }
+    return mapped;
+  }
+
+  dossier(handles: readonly string[], maxBytes = 18_000): VerificationEvidenceDossierEntry[] {
+    const result: VerificationEvidenceDossierEntry[] = [];
+    const boundedMaximum = Math.max(0, maxBytes);
+    for (const handle of new Set(handles)) {
+      const entry = this.#dossier.get(handle);
+      if (entry === undefined || boundedMaximum === 0) continue;
+      const bounded = fitDossierEntry(result, entry, boundedMaximum);
+      if (bounded === undefined) break;
+      result.push(bounded);
+    }
+    return result;
+  }
+
+  toolAvailability(name: string): "untried" | "succeeded" | "failed" {
+    const statuses = this.#toolStatuses.get(name);
+    if (statuses === undefined) return "untried";
+    return statuses.has("ok") ? "succeeded" : "failed";
   }
 
   coverage(): EvidenceCoverage {
@@ -80,74 +104,73 @@ class OpaqueVerificationEvidenceTools implements EvidenceTools {
     }
     const unresolved = (raw.unresolvedEvidence ?? []).map((entry) => ({
       ...entry,
-      scope: this.#handles.get(entry.scope) ?? entry.scope,
+      scope: this.#observationHandle(entry.scope),
     }));
-    const remainingUnresolved = unresolved.filter((entry) => (
-      !this.#supersededHandles.has(entry.scope)
-    ));
-    const allUnresolvedLimitations = new Set(unresolved.map((entry) => entry.limitation));
-    const remainingUnresolvedLimitations = new Set(
-      remainingUnresolved.map((entry) => entry.limitation),
-    );
-    const limitations = raw.limitations.filter((limitation) => (
-      !allUnresolvedLimitations.has(limitation)
-      || remainingUnresolvedLimitations.has(limitation)
-    ));
-    const completedEvidenceScopes = [...new Set([
-      ...(raw.completedEvidenceScopes ?? []).flatMap((scope) => {
-        const handle = this.#handles.get(scope);
-        return handle === undefined ? [] : [handle];
-      }),
-      ...this.#supersededHandles,
-    ])].sort(handleOrder);
+    const completedEvidenceScopes = [...new Set(
+      (raw.completedEvidenceScopes ?? []).map((scope) => this.#proofHandle(scope)),
+    )].sort(handleOrder);
     const completedChangedPatchScopes = (raw.completedChangedPatchScopes ?? []).flatMap((entry) => {
-      const handle = this.#handles.get(entry.scope);
+      const handle = this.#proofHandles.get(entry.scope);
       return handle === undefined ? [] : [{ ...entry, scope: handle }];
     });
 
     return {
       ...raw,
-      sufficient: limitations.length === 0,
-      limitations,
-      unresolvedEvidence: remainingUnresolved,
+      unresolvedEvidence: unresolved,
       completedEvidenceScopes,
       completedChangedPatchScopes,
     };
   }
 
-  #handle(scope: string): string {
-    const existing = this.#handles.get(scope);
+  #proofHandle(scope: string): string {
+    const existing = this.#proofHandles.get(scope);
     if (existing !== undefined) return existing;
-    const handle = `${EVIDENCE_HANDLE_PREFIX}-${this.#nextHandle++}`;
-    this.#handles.set(scope, handle);
+    const handle = `${EVIDENCE_HANDLE_PREFIX}-${this.#nextProofHandle++}`;
+    this.#proofHandles.set(scope, handle);
+    return handle;
+  }
+
+  #observationHandle(scope: string): string {
+    const existing = this.#observationHandles.get(scope);
+    if (existing !== undefined) return existing;
+    const handle = `${OBSERVATION_HANDLE_PREFIX}-${this.#nextObservationHandle++}`;
+    this.#observationHandles.set(scope, handle);
     return handle;
   }
 }
 
-function readIdentity(rawArguments: string): Omit<IncompleteRead, "handle"> | undefined {
-  try {
-    const parsed = JSON.parse(rawArguments || "{}") as unknown;
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-    const args = parsed as Record<string, unknown>;
-    if (typeof args.path !== "string" || args.path.trim().length === 0) return undefined;
-    const startLine = positiveInteger(args.start_line, 1);
-    const endLine = positiveInteger(args.end_line, 300);
-    if (endLine < startLine) return undefined;
-    return {
-      path: args.path.trim().replace(/^\.\//, "").replace(/^\/+/, ""),
-      ref: args.ref === "base" ? "base" : "head",
-      startLine,
-      endLine,
+function fitDossierEntry(
+  prefix: VerificationEvidenceDossierEntry[],
+  entry: VerificationEvidenceDossierEntry,
+  maxBytes: number,
+): VerificationEvidenceDossierEntry | undefined {
+  const bytes = new TextEncoder().encode(entry.content);
+  let low = 0;
+  let high = bytes.byteLength;
+  let best: VerificationEvidenceDossierEntry | undefined;
+  while (low <= high) {
+    const count = Math.floor((low + high) / 2);
+    const content = new TextDecoder().decode(bytes.slice(0, count));
+    const candidate = {
+      ...entry,
+      content: count === bytes.byteLength ? content : `${content}…`,
     };
-  } catch {
-    return undefined;
+    if (byteLength(JSON.stringify([...prefix, candidate])) <= maxBytes) {
+      best = candidate;
+      low = count + 1;
+    } else {
+      high = count - 1;
+    }
   }
+  return best;
 }
 
-function positiveInteger(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isInteger(value) && value > 0
-    ? value
-    : fallback;
+function safeArguments(rawArguments: string): unknown {
+  try {
+    return JSON.parse(rawArguments) as unknown;
+  } catch {
+    return {};
+  }
 }
 
 function handleOrder(left: string, right: string): number {
@@ -176,7 +199,7 @@ export async function prefetchVerificationAnchors(
       side: finding.side,
     }), signal);
     return {
-      candidateId: `GASTON-CANDIDATE-${index + 1}`,
+      candidateId: verificationCandidateId(finding.title) ?? `GASTON-CANDIDATE-${index + 1}`,
       path: finding.path,
       line: finding.line,
       side: finding.side,

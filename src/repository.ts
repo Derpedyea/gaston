@@ -1,7 +1,12 @@
 import type { WorkspaceClient } from "@cloudflare/computer";
 
 import { EvidenceCoverageTracker, type EvidenceCoverage, type EvidenceResult } from "./evidence.ts";
+import { pinnedDependencySource } from "./dependency-evidence.ts";
 import { GitHubApiError, type GitHubClient } from "./github.ts";
+import {
+  RepositorySnapshot,
+  type RepositorySnapshotReport,
+} from "./repository-snapshot.ts";
 import type {
   PullChangeSet,
   RepositoryEntry,
@@ -15,6 +20,7 @@ export const REVIEW_SESSION_DIFF_PATH = `${RUN_ROOT}/context/diff.patch`;
 export const REVIEW_SESSION_FILES_PATH = `${RUN_ROOT}/context/session-files.json`;
 const REF_CACHE_ROOT = `${ROOT}/cache/refs`;
 const MAX_FILE_BYTES = 400_000;
+const MAX_DEPENDENCY_LOCK_BYTES = 2_000_000;
 const MAX_TOOL_RESULT_BYTES = 12_000;
 export const INITIAL_DIFF_EXCERPT_BYTES = 40_000;
 const DEFAULT_PATCH_LINES = 200;
@@ -35,24 +41,47 @@ export interface RepositoryCacheSnapshot {
   hitRate: number;
 }
 
+export interface RepositoryWorkspaceOptions {
+  /** Materialize the exact PR-head archive into the immutable Computer cache. */
+  snapshot?: boolean;
+}
+
 export class RepositoryWorkspace {
   readonly #workspace: WorkspaceClient;
   readonly #github: GitHubClient;
   readonly #job: ReviewJob;
+  readonly #snapshot: RepositorySnapshot | null;
   readonly changes: PullChangeSet;
   #tree: RepositoryEntry[] | null = null;
   #treeTruncated = false;
   #cacheHits = 0;
   #cacheMisses = 0;
+  #snapshotReport: RepositorySnapshotReport = { status: "disabled" };
 
-  constructor(workspace: WorkspaceClient, github: GitHubClient, job: ReviewJob, changes: PullChangeSet) {
+  constructor(
+    workspace: WorkspaceClient,
+    github: GitHubClient,
+    job: ReviewJob,
+    changes: PullChangeSet,
+    options: RepositoryWorkspaceOptions = {},
+  ) {
     this.#workspace = workspace;
     this.#github = github;
     this.#job = job;
     this.changes = changes;
+    this.#snapshot = options.snapshot === true
+      ? new RepositorySnapshot({
+        fs: workspace.fs,
+        ref: job.headSha,
+        cacheRoot: REF_CACHE_ROOT,
+        loadArchive: (signal) => github.getRepositoryArchive(job, job.headSha, signal),
+        loadInventory: (signal) => github.getRepositoryTree(job, job.headSha, signal),
+        loadControlFile: (path, signal) => github.readFile(job, path, job.headSha, MAX_FILE_BYTES, signal),
+      })
+      : null;
   }
 
-  async initialize(checks: Array<Record<string, unknown>>): Promise<void> {
+  async initialize(checks: Array<Record<string, unknown>>, signal?: AbortSignal): Promise<void> {
     await this.#workspace.fs.rm(RUN_ROOT, { recursive: true, force: true });
     await this.#workspace.fs.mkdir(`${RUN_ROOT}/context`, { recursive: true });
     await this.#workspace.fs.mkdir(REF_CACHE_ROOT, { recursive: true });
@@ -74,6 +103,24 @@ export class RepositoryWorkspace {
         diffTruncated: this.changes.diffTruncated ?? this.changes.truncated,
       })),
     ]);
+    if (this.#snapshot !== null) {
+      try {
+        this.#snapshotReport = await this.#snapshot.ensure(signal);
+      } catch (error) {
+        throwIfAborted(signal);
+        // A repository archive is an accuracy optimization, not a new review
+        // availability dependency. Existing exact file/tree APIs remain the
+        // safe fallback when a repository cannot be snapshotted.
+        this.#snapshotReport = {
+          status: "unavailable",
+          reason: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+  }
+
+  snapshotReport(): RepositorySnapshotReport {
+    return this.#snapshotReport;
   }
 
   cacheSnapshot(): RepositoryCacheSnapshot {
@@ -159,8 +206,33 @@ export class RepositoryWorkspace {
   ): Promise<string> {
     const boundedLimit = Math.max(1, Math.min(limit, 20));
     if (pathPrefix) safePath(pathPrefix.replace(/\/$/, ""));
+    if (this.#snapshot !== null) {
+      const local = await this.#snapshot.search(query, pathPrefix, boundedLimit, signal);
+      if (local !== undefined) return renderSearchResults(local.matches, local.truncated);
+    }
     const result = await this.#github.searchCode(this.#job, query, pathPrefix, boundedLimit, signal);
     return renderSearchResults(result.matches, result.truncated);
+  }
+
+  async dependencySource(
+    packageName: string,
+    query: string,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<string> {
+    return pinnedDependencySource({
+      packageName,
+      query,
+      limit,
+      readHeadFile: (path, readSignal) => this.#github.readFile(
+        this.#job,
+        path,
+        this.#job.headSha,
+        MAX_DEPENDENCY_LOCK_BYTES,
+        readSignal,
+      ),
+      ...(signal === undefined ? {} : { signal }),
+    });
   }
 
   async optionalBaseFile(path: string, signal?: AbortSignal): Promise<string> {
@@ -214,6 +286,13 @@ export class RepositoryWorkspace {
   async #loadTree(signal?: AbortSignal): Promise<void> {
     throwIfAborted(signal);
     if (this.#tree) return;
+    const snapshotTree = await this.#snapshot?.tree();
+    if (snapshotTree !== undefined) {
+      this.#cacheHits++;
+      this.#tree = snapshotTree.entries;
+      this.#treeTruncated = snapshotTree.truncated;
+      return;
+    }
     const result = await this.#cachedTree(this.#job.headSha, signal);
     this.#tree = result.entries;
     this.#treeTruncated = result.truncated;
@@ -240,6 +319,13 @@ export class RepositoryWorkspace {
   async #cachedFile(path: string, ref: RepositoryRef, signal?: AbortSignal): Promise<string> {
     throwIfAborted(signal);
     const sha = ref === "head" ? this.#job.headSha : this.#job.baseSha;
+    if (ref === "head" && this.#snapshot !== null) {
+      const snapshotContent = await this.#snapshot.read(path);
+      if (snapshotContent !== undefined) {
+        this.#cacheHits++;
+        return snapshotContent;
+      }
+    }
     const cachePath = `${REF_CACHE_ROOT}/${sha}/files/${path}`;
     if (await fileExists(this.#workspace, cachePath)) {
       this.#cacheHits++;
@@ -835,6 +921,14 @@ export class RepositoryTools {
             signal,
           );
           break;
+        case "dependency_source":
+          content = await this.#repo.dependencySource(
+            requiredString(args.package, "package"),
+            requiredString(args.query, "query"),
+            integerArgument(args.limit, "limit", 1, 20, 10),
+            signal,
+          );
+          break;
         default:
           throw new Error(`unknown tool: ${name}`);
       }
@@ -1035,6 +1129,11 @@ function evidenceScope(
     const limit = Math.max(1, Math.min(optionalInteger(args?.limit) ?? 10, 20));
     return `${name}:${query}:path=${prefix}:limit=${limit}`;
   }
+  if (name === "dependency_source") {
+    const packageName = typeof args?.package === "string" ? args.package.trim() : "";
+    const query = typeof args?.query === "string" ? args.query.trim() : "";
+    return `${name}:${packageName}:${query}`;
+  }
   return name;
 }
 
@@ -1154,6 +1253,7 @@ const TOOL_ARGUMENT_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
   repository_tree: new Set(["prefix", "limit"]),
   read_file: new Set(["path", "ref", "start_line", "end_line"]),
   search_code: new Set(["query", "path_prefix", "limit"]),
+  dependency_source: new Set(["package", "query", "limit"]),
 };
 
 function validateToolArguments(name: string, args: Record<string, unknown>): void {

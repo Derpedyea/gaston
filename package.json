@@ -15,6 +15,8 @@
     "diagnose:pr": "bun tools/diagnose-pr.mjs",
     "eval:harness": "bun tools/run-harness-eval.ts",
     "eval:models": "bun tools/run-recent-pr-bench.ts",
+    "eval:replay-verification": "bun tools/replay-verification.ts",
+    "eval:verifier-calibration": "bun tools/check-verifier-calibration.ts",
     "eval:historical": "bun tools/validate-historical-corpus.ts",
     "fixtures:capture": "bun tools/capture-historical-prs.ts",
     "test": "vitest run",

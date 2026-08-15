@@ -7,6 +7,7 @@ import type {
   Severity,
   VerificationOutput,
   VerificationVerdict,
+  VerificationEvidenceGapKind,
 } from "./types.ts";
 
 const SEVERITIES = new Set<Severity>(["blocker", "high", "medium", "low"]);
@@ -53,6 +54,7 @@ export function parseReviewOutput(raw: string): ReviewOutput {
     const why = cleanText(value.why, 2_000);
     const evidence = cleanText(value.evidence, 2_000);
     const suggestedFix = cleanText(value.suggestedFix ?? value.suggested_fix, 2_000);
+    const proofObligations = parseProofObligations(value.proofObligations);
 
     if (
       !path ||
@@ -79,10 +81,23 @@ export function parseReviewOutput(raw: string): ReviewOutput {
       evidence,
       suggestedFix,
       confidence: Math.max(0, Math.min(1, confidence)),
+      ...(proofObligations === undefined ? {} : { proofObligations }),
     }];
   });
 
   return { summary, findings };
+}
+
+function parseProofObligations(value: unknown): Finding["proofObligations"] | undefined {
+  if (!isRecord(value)) return undefined;
+  const trigger = cleanText(value.trigger, 1_000);
+  const changedBehavior = cleanText(value.changedBehavior, 1_000);
+  const executionPath = cleanText(value.executionPath, 1_000);
+  const observableFailure = cleanText(value.observableFailure, 1_000);
+  const falsifier = cleanText(value.falsifier, 1_000);
+  const unresolvedFact = cleanText(value.unresolvedFact, 1_000);
+  if (!trigger || !changedBehavior || !executionPath || !observableFailure || !falsifier) return undefined;
+  return { trigger, changedBehavior, executionPath, observableFailure, falsifier, unresolvedFact };
 }
 
 /**
@@ -258,6 +273,7 @@ export function tagVerificationCandidates(discoveries: ReviewOutput[]): ReviewOu
 
 export interface VerificationResolution {
   review: ReviewOutput;
+  candidateFates: CandidateFate[];
   candidateCount: number;
   confirmedCandidateIds: string[];
   refutedCandidateIds: string[];
@@ -269,6 +285,44 @@ export interface VerificationResolution {
   withheldConfirmedCandidateCount: number;
   /** Terminal completeness, including confirmed findings withheld at publication. */
   incomplete: boolean;
+}
+
+export type CandidateVerificationReason =
+  | "confirmed"
+  | "refuted"
+  | "missing_verdict"
+  | "duplicate_verdict"
+  | "malformed_verdict"
+  | "anchor_mismatch"
+  | "model_insufficient"
+  | "evidence_incomplete"
+  | "missing_evidence_statement"
+  | "missing_evidence_scopes"
+  | "unknown_evidence_scope"
+  | "missing_changed_anchor_evidence";
+
+export type CandidatePublicationReason =
+  | "published"
+  | "not_confirmed"
+  | "below_confidence"
+  | "invalid_changed_line"
+  | "duplicate"
+  | "finding_cap";
+
+export interface CandidateFate {
+  candidateId: string;
+  finding: Finding;
+  verification: {
+    state: "confirmed" | "refuted" | "insufficient";
+    reason: CandidateVerificationReason;
+    confidence: number | null;
+    evidenceScopes: string[];
+    missingEvidenceKind: VerificationEvidenceGapKind | null;
+    missingEvidence: string;
+  };
+  publication:
+    | { state: "pending"; reason: null }
+    | { state: "published" | "withheld" | "not_applicable"; reason: CandidatePublicationReason };
 }
 
 /**
@@ -286,7 +340,7 @@ export function resolveVerificationVerdicts(
   const completedEvidenceScopes = new Set(completedEvidence.completedEvidenceScopes ?? []);
   const completedChangedPatchScopes = completedEvidence.completedChangedPatchScopes ?? [];
   const candidates = new Map(discoveries.flatMap((review) => review.findings.flatMap((finding) => {
-    const id = candidateId(finding.title);
+    const id = verificationCandidateId(finding.title);
     return id === undefined ? [] : [[id, finding] as const];
   })));
   const entries = new Map<string, VerificationVerdict[]>();
@@ -302,41 +356,89 @@ export function resolveVerificationVerdicts(
   }
 
   const findings: Finding[] = [];
+  const candidateFates: CandidateFate[] = [];
   const confirmedCandidateIds: string[] = [];
   const refutedCandidateIds: string[] = [];
   const insufficientCandidateIds: string[] = [];
   for (const [id, candidate] of candidates) {
+    const finding = { ...candidate, title: stripCandidateTag(candidate.title) };
     const candidateVerdicts = entries.get(id) ?? [];
-    if (candidateVerdicts.length !== 1) {
+    const recordFate = (
+      state: CandidateFate["verification"]["state"],
+      reason: CandidateVerificationReason,
+      verdict?: VerificationVerdict,
+    ): void => {
+      candidateFates.push({
+        candidateId: id,
+        finding,
+        verification: {
+          state,
+          reason,
+          confidence: verdict?.confidence ?? null,
+          evidenceScopes: verdict?.evidenceScopes ?? [],
+          missingEvidenceKind: verdict?.missingEvidenceKind ?? null,
+          missingEvidence: verdict?.missingEvidence ?? "",
+        },
+        publication: state === "confirmed"
+          ? { state: "pending", reason: null }
+          : { state: "not_applicable", reason: "not_confirmed" },
+      });
+    };
+    if (candidateVerdicts.length === 0) {
       insufficientCandidateIds.push(id);
+      recordFate("insufficient", "missing_verdict");
+      continue;
+    }
+    if (candidateVerdicts.length > 1) {
+      insufficientCandidateIds.push(id);
+      recordFate("insufficient", "duplicate_verdict", candidateVerdicts[0]);
       continue;
     }
     const [verdict] = candidateVerdicts;
+    if (verdict === undefined || !verdict.valid || verdict.verdict === null) {
+      insufficientCandidateIds.push(id);
+      recordFate("insufficient", "malformed_verdict", verdict);
+      continue;
+    }
     if (
-      verdict === undefined
-      || !verdict.valid
-      || verdict.path !== candidate.path
+      verdict.path !== candidate.path
       || verdict.side !== candidate.side
       || verdict.line !== candidate.line
-      || verdict.verdict === null
     ) {
       insufficientCandidateIds.push(id);
+      recordFate("insufficient", "anchor_mismatch", verdict);
       continue;
     }
     if (verdict.verdict === "insufficient") {
       insufficientCandidateIds.push(id);
+      recordFate("insufficient", "model_insufficient", verdict);
       continue;
     }
     // Both terminal verdicts need a complete, auditable evidence claim, and
     // every model-cited scope must exist in the harness-owned effective
     // completion ledger. Unsupported `refuted` output is deliberately not a
     // veto, even when the model labels its own evidence complete.
-    if (
-      verdict.evidenceComplete !== true
-      || !verdict.evidence
-      || verdict.evidenceScopes.length === 0
-      || verdict.evidenceScopes.some((scope) => !completedEvidenceScopes.has(scope))
-      || !verdict.evidenceScopes.some((scope) => completedChangedPatchScopes.some((entry) => (
+    if (verdict.evidenceComplete !== true) {
+      insufficientCandidateIds.push(id);
+      recordFate("insufficient", "evidence_incomplete", verdict);
+      continue;
+    }
+    if (!verdict.evidence) {
+      insufficientCandidateIds.push(id);
+      recordFate("insufficient", "missing_evidence_statement", verdict);
+      continue;
+    }
+    if (verdict.evidenceScopes.length === 0) {
+      insufficientCandidateIds.push(id);
+      recordFate("insufficient", "missing_evidence_scopes", verdict);
+      continue;
+    }
+    if (verdict.evidenceScopes.some((scope) => !completedEvidenceScopes.has(scope))) {
+      insufficientCandidateIds.push(id);
+      recordFate("insufficient", "unknown_evidence_scope", verdict);
+      continue;
+    }
+    if (!verdict.evidenceScopes.some((scope) => completedChangedPatchScopes.some((entry) => (
         entry.scope === scope
         && entry.path === candidate.path
         && (
@@ -345,26 +447,26 @@ export function resolveVerificationVerdicts(
             && entry.sourceLine === candidate.line
             && entry.sourceSide === candidate.side
         )
-      )))
-    ) {
+      )))) {
       insufficientCandidateIds.push(id);
+      recordFate("insufficient", "missing_changed_anchor_evidence", verdict);
       continue;
     }
     if (verdict.verdict === "refuted") {
       refutedCandidateIds.push(id);
+      recordFate("refuted", "refuted", verdict);
       continue;
     }
     confirmedCandidateIds.push(id);
-    findings.push({
-      ...candidate,
-      title: stripCandidateTag(candidate.title),
-      confidence: verdict.confidence!,
-    });
+    finding.confidence = verdict.confidence!;
+    findings.push(finding);
+    recordFate("confirmed", "confirmed", verdict);
   }
 
   const verificationIncomplete = insufficientCandidateIds.length > 0 || invalidVerdictCount > 0;
   return {
     review: { summary: verification.summary, findings },
+    candidateFates,
     candidateCount: candidates.size,
     confirmedCandidateIds,
     refutedCandidateIds,
@@ -414,13 +516,14 @@ export function finalizeVerificationPublication(
     options.configuredBaseThreshold,
     options.configuredIncompleteEvidenceFloor,
   );
-  let filtered = filterFindings(
-    resolution.review,
+  let publication = publishCandidateFates(
+    resolution,
     options.changedLines,
     confirmedFindingThreshold,
     options.maxFindings,
   );
-  let reconciled = reconcilePublishedConfirmations(resolution, filtered);
+  let filtered = publication.review;
+  let reconciled = reconcilePublishedConfirmations(resolution, filtered, publication.candidateFates);
 
   if (reconciled.withheldConfirmedCandidateCount > 0) {
     policy = publicationPolicyForEvidence(
@@ -431,13 +534,18 @@ export function finalizeVerificationPublication(
       options.configuredIncompleteEvidenceFloor,
       true,
     );
-    filtered = filterFindings(
-      resolution.review,
+    publication = publishCandidateFates(
+      resolution,
       options.changedLines,
       confirmedFindingThreshold,
       options.maxFindings,
     );
-    reconciled = reconcilePublishedConfirmations(resolution, filtered);
+    filtered = publication.review;
+    reconciled = reconcilePublishedConfirmations(
+      resolution,
+      filtered,
+      publication.candidateFates,
+    );
   }
 
   return {
@@ -451,6 +559,7 @@ export function finalizeVerificationPublication(
 function reconcilePublishedConfirmations(
   resolution: VerificationResolution,
   published: ReviewOutput,
+  candidateFates: CandidateFate[],
 ): VerificationResolution {
   const withheldConfirmedCandidateCount = Math.max(
     0,
@@ -458,8 +567,68 @@ function reconcilePublishedConfirmations(
   );
   return {
     ...resolution,
+    candidateFates,
     withheldConfirmedCandidateCount,
     incomplete: resolution.verificationIncomplete || withheldConfirmedCandidateCount > 0,
+  };
+}
+
+function publishCandidateFates(
+  resolution: VerificationResolution,
+  changedLines: Map<string, ChangedLines>,
+  minConfidence: number,
+  maxFindings: number,
+): { review: ReviewOutput; candidateFates: CandidateFate[] } {
+  const publication = new Map<string, CandidateFate["publication"]>();
+  const seen = new Set<string>();
+  const eligible: CandidateFate[] = [];
+
+  for (const fate of resolution.candidateFates) {
+    if (fate.verification.state !== "confirmed") {
+      publication.set(fate.candidateId, { state: "not_applicable", reason: "not_confirmed" });
+      continue;
+    }
+    const finding = fate.finding;
+    if (finding.confidence < minConfidence) {
+      publication.set(fate.candidateId, { state: "withheld", reason: "below_confidence" });
+      continue;
+    }
+    const lines = changedLines.get(finding.path);
+    const validLines = finding.side === "LEFT" ? lines?.left : lines?.right;
+    if (validLines?.has(finding.line) !== true) {
+      publication.set(fate.candidateId, { state: "withheld", reason: "invalid_changed_line" });
+      continue;
+    }
+    const key = `${finding.path}:${finding.side}:${finding.line}:${finding.title.toLowerCase()}`;
+    if (seen.has(key)) {
+      publication.set(fate.candidateId, { state: "withheld", reason: "duplicate" });
+      continue;
+    }
+    seen.add(key);
+    eligible.push(fate);
+  }
+
+  eligible.sort((left, right) => compareFindings(left.finding, right.finding));
+  const published = eligible.slice(0, Math.max(0, maxFindings));
+  const publishedIds = new Set(published.map((fate) => fate.candidateId));
+  for (const fate of eligible) {
+    publication.set(fate.candidateId, publishedIds.has(fate.candidateId)
+      ? { state: "published", reason: "published" }
+      : { state: "withheld", reason: "finding_cap" });
+  }
+
+  return {
+    review: {
+      summary: resolution.review.summary,
+      findings: published.map((fate) => fate.finding),
+    },
+    candidateFates: resolution.candidateFates.map((fate) => ({
+      ...fate,
+      publication: publication.get(fate.candidateId) ?? {
+        state: "not_applicable",
+        reason: "not_confirmed",
+      },
+    })),
   };
 }
 
@@ -638,7 +807,7 @@ function compareFindings(a: Finding, b: Finding): number {
   return rank[a.severity] - rank[b.severity] || b.confidence - a.confidence;
 }
 
-function candidateId(title: string): string | undefined {
+export function verificationCandidateId(title: string): string | undefined {
   return title.match(new RegExp(`^\\[(${VERIFICATION_CANDIDATE_PREFIX}-\\d+)\\]\\s+`))?.[1];
 }
 
@@ -655,6 +824,8 @@ function parseVerificationVerdict(value: unknown): VerificationVerdict {
     "evidence",
     "evidenceComplete",
     "evidenceScopes",
+    "missingEvidenceKind",
+    "missingEvidence",
   ]);
   const candidateIdValue = cleanText(record.candidateId, 100);
   const candidateId = /^GASTON-CANDIDATE-[1-9]\d*$/.test(candidateIdValue)
@@ -677,6 +848,15 @@ function parseVerificationVerdict(value: unknown): VerificationVerdict {
   const evidenceScopes = Array.isArray(record.evidenceScopes)
     ? record.evidenceScopes.map((scope) => cleanText(scope, 500)).filter(Boolean)
     : [];
+  const missingEvidenceKind = record.missingEvidenceKind === "repository_reachability"
+      || record.missingEvidenceKind === "repository_symbol"
+      || record.missingEvidenceKind === "dependency_contract"
+      || record.missingEvidenceKind === "runtime_semantics"
+      || record.missingEvidenceKind === "tool_failure"
+      || record.missingEvidenceKind === "unknown"
+    ? record.missingEvidenceKind
+    : record.missingEvidenceKind === null ? null : undefined;
+  const missingEvidence = cleanText(record.missingEvidence, 2_000);
   const scopesValid = Array.isArray(record.evidenceScopes)
     && record.evidenceScopes.every((scope) => typeof scope === "string" && cleanText(scope, 500).length > 0)
     && new Set(evidenceScopes).size === evidenceScopes.length;
@@ -693,7 +873,11 @@ function parseVerificationVerdict(value: unknown): VerificationVerdict {
     && confidenceValid
     && rationale.length > 0
     && evidenceComplete !== null
-    && scopesValid;
+    && scopesValid
+    && missingEvidenceKind !== undefined
+    && (verdict === "insufficient"
+      ? evidenceComplete === false && missingEvidenceKind !== null && missingEvidence.length > 0
+      : missingEvidenceKind === null && missingEvidence.length === 0);
   return {
     candidateId,
     verdict,
@@ -705,6 +889,8 @@ function parseVerificationVerdict(value: unknown): VerificationVerdict {
     evidence,
     evidenceComplete,
     evidenceScopes,
+    missingEvidenceKind: missingEvidenceKind ?? null,
+    missingEvidence,
     valid,
   };
 }

@@ -1,0 +1,1147 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="A code-derived walkthrough of Gaston's pull request review flow.">
+  <title>How Gaston Reviewbot Works</title>
+  <style>
+    :root {
+      --canvas: oklch(0.14 0.006 125);
+      --surface: oklch(0.18 0.007 125);
+      --surface-raised: oklch(0.205 0.008 125);
+      --well: oklch(0.115 0.005 125);
+      --text: oklch(0.96 0.004 105);
+      --muted: oklch(0.69 0.012 110);
+      --quiet: oklch(0.52 0.012 110);
+      --line: oklch(1 0 0 / 0.1);
+      --line-strong: oklch(1 0 0 / 0.18);
+      --accent: oklch(0.84 0.18 122);
+      --accent-ink: oklch(0.18 0.05 120);
+      --accent-soft: oklch(0.84 0.18 122 / 0.1);
+      --amber: oklch(0.82 0.14 82);
+      --amber-soft: oklch(0.82 0.14 82 / 0.1);
+      --rose: oklch(0.72 0.17 22);
+      --rose-soft: oklch(0.72 0.17 22 / 0.1);
+      --radius: 0.75rem;
+      --page: 76rem;
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      min-width: 20rem;
+      scroll-behavior: smooth;
+      background: var(--canvas);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    body {
+      min-height: 100dvh;
+      margin: 0;
+      color: var(--text);
+      background: var(--canvas);
+      font-family: InterVariable, Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-feature-settings: "cv02", "cv03", "cv04", "cv11", "ss01", "ss03";
+    }
+
+    a { color: inherit; }
+
+    button,
+    a { -webkit-tap-highlight-color: transparent; }
+
+    button { font: inherit; }
+
+    code,
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    }
+
+    .shell { isolation: isolate; }
+
+    .topbar {
+      border-bottom: 1px solid var(--line);
+      background: var(--canvas);
+    }
+
+    .topbar-inner,
+    .page {
+      width: min(100%, var(--page));
+      margin-inline: auto;
+      padding-inline: 1rem;
+    }
+
+    .topbar-inner {
+      display: flex;
+      min-height: 3.75rem;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.625rem;
+      text-decoration: none;
+    }
+
+    .brand:focus-visible,
+    .stage:focus-visible,
+    .source-link:focus-visible,
+    .reference-link:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 3px;
+    }
+
+    .brand img {
+      width: 2rem;
+      height: 2rem;
+      flex: 0 0 auto;
+      image-rendering: pixelated;
+    }
+
+    .brand-name { font-weight: 600; }
+
+    .topbar-label {
+      color: var(--quiet);
+      font-size: 0.8125rem;
+    }
+
+    .page { padding-bottom: 4rem; }
+
+    .hero {
+      display: grid;
+      gap: 2rem;
+      padding-block: 4rem 3rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .eyebrow {
+      margin: 0;
+      color: var(--accent);
+      font-size: 0.75rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    h1,
+    h2,
+    h3,
+    p { margin: 0; }
+
+    h1,
+    h2,
+    h3 {
+      text-wrap: balance;
+      font-weight: 600;
+    }
+
+    h1 {
+      max-width: 18ch;
+      padding-top: 0.875rem;
+      font-size: clamp(2.5rem, 6vw, 4.75rem);
+      line-height: 1.02;
+      letter-spacing: -0.045em;
+    }
+
+    .hero-copy {
+      max-width: 62ch;
+      padding-top: 1.25rem;
+      color: var(--muted);
+      font-size: 1.0625rem;
+      line-height: 1.7;
+      text-wrap: pretty;
+    }
+
+    .invariant {
+      align-self: end;
+      padding: 1.25rem;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .invariant-label {
+      color: var(--quiet);
+      font-size: 0.75rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .invariant p:last-child {
+      padding-top: 0.75rem;
+      font-size: 1.125rem;
+      line-height: 1.55;
+      text-wrap: pretty;
+    }
+
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 1px;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--line);
+    }
+
+    .stat {
+      min-width: 0;
+      padding: 1rem;
+      background: var(--canvas);
+    }
+
+    .stat-value {
+      font-variant-numeric: tabular-nums;
+      font-size: 1.5rem;
+      font-weight: 600;
+    }
+
+    .stat-label {
+      padding-top: 0.375rem;
+      color: var(--quiet);
+      font-size: 0.875rem;
+      line-height: 1.45;
+    }
+
+    section { padding-top: 3.5rem; }
+
+    .section-heading {
+      display: grid;
+      gap: 0.625rem;
+    }
+
+    .section-heading h2 {
+      max-width: 28ch;
+      font-size: clamp(1.75rem, 3.5vw, 2.5rem);
+      letter-spacing: -0.03em;
+    }
+
+    .section-heading > p {
+      max-width: 68ch;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.65;
+      text-wrap: pretty;
+    }
+
+    .flow-rail {
+      display: grid;
+      gap: 0.75rem;
+      padding-top: 2rem;
+    }
+
+    .stage {
+      position: relative;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: 0.75rem;
+      width: 100%;
+      min-height: 4.75rem;
+      padding: 0.875rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      color: var(--muted);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .stage[aria-selected="true"] {
+      border-color: oklch(0.84 0.18 122 / 0.45);
+      color: var(--text);
+      background: var(--accent-soft);
+    }
+
+    .stage-index {
+      display: grid;
+      width: 1.75rem;
+      height: 1.75rem;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      border-radius: 50%;
+      color: var(--quiet);
+      font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .stage[aria-selected="true"] .stage-index {
+      border-color: var(--accent);
+      color: var(--accent-ink);
+      background: var(--accent);
+    }
+
+    .stage-title {
+      color: inherit;
+      font-size: 0.9375rem;
+      font-weight: 600;
+    }
+
+    .stage-subtitle {
+      padding-top: 0.25rem;
+      color: var(--quiet);
+      font-size: 1rem;
+      line-height: 1.4;
+    }
+
+    .stage-detail {
+      display: grid;
+      gap: 1.5rem;
+      margin-top: 1.25rem;
+      padding: 1.5rem;
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .detail-position {
+      color: var(--accent);
+      font-size: 0.75rem;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+
+    .detail-title {
+      max-width: 32ch;
+      padding-top: 0.5rem;
+      font-size: 1.5rem;
+      letter-spacing: -0.02em;
+    }
+
+    .detail-summary {
+      max-width: 66ch;
+      padding-top: 0.75rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.65;
+      text-wrap: pretty;
+    }
+
+    .detail-grid {
+      display: grid;
+      gap: 1.5rem;
+      padding-top: 0.25rem;
+    }
+
+    .detail-block {
+      padding-top: 1rem;
+      border-top: 1px solid var(--line);
+    }
+
+    .detail-block h3 {
+      font-size: 0.875rem;
+    }
+
+    .detail-block ul {
+      display: grid;
+      gap: 0.625rem;
+      margin: 0;
+      padding: 0.75rem 0 0 1.125rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.55;
+    }
+
+    .source-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding-top: 0.875rem;
+    }
+
+    .source-link,
+    .reference-link {
+      border-radius: 0.375rem;
+      color: var(--accent);
+      text-underline-offset: 0.2em;
+    }
+
+    .source-link {
+      padding: 0.375rem 0.5rem;
+      background: var(--well);
+      font-size: 0.75rem;
+      text-decoration: none;
+    }
+
+    .architecture {
+      display: grid;
+      gap: 1px;
+      margin-top: 2rem;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--line);
+    }
+
+    .architecture-node {
+      min-width: 0;
+      padding: 1.125rem;
+      background: var(--canvas);
+    }
+
+    .architecture-node p:first-child {
+      color: var(--quiet);
+      font-size: 0.75rem;
+    }
+
+    .architecture-node h3 {
+      padding-top: 0.4rem;
+      font-size: 1rem;
+    }
+
+    .architecture-node p:last-child {
+      padding-top: 0.5rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+
+    .architecture-node.accent { background: var(--accent-soft); }
+
+    .gates {
+      display: grid;
+      gap: 1.5rem;
+      padding-top: 2rem;
+    }
+
+    .gate {
+      padding-top: 1.25rem;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .gate-number {
+      color: var(--quiet);
+      font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .gate h3 {
+      padding-top: 0.5rem;
+      font-size: 1.125rem;
+    }
+
+    .gate > p {
+      padding-top: 0.625rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.6;
+      text-wrap: pretty;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      padding-top: 0.875rem;
+    }
+
+    .chip {
+      padding: 0.35rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+    }
+
+    .chip.good { color: var(--accent); background: var(--accent-soft); }
+    .chip.warn { color: var(--amber); background: var(--amber-soft); }
+    .chip.stop { color: var(--rose); background: var(--rose-soft); }
+
+    .branch-wrap {
+      margin-top: 2rem;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    .outcomes {
+      width: 100%;
+      min-width: 43rem;
+      border-collapse: collapse;
+      text-align: left;
+    }
+
+    .outcomes th,
+    .outcomes td {
+      padding: 0.875rem 1rem;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    .outcomes tr:last-child td { border-bottom: 0; }
+
+    .outcomes th {
+      color: var(--quiet);
+      background: var(--well);
+      font-size: 0.75rem;
+      font-weight: 500;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .outcomes td {
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+
+    .outcomes td:first-child {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .status {
+      display: inline-flex;
+      padding: 0.25rem 0.5rem;
+      border-radius: 999px;
+      white-space: nowrap;
+      font-size: 0.75rem;
+    }
+
+    .status.success { color: var(--accent); background: var(--accent-soft); }
+    .status.neutral { color: var(--amber); background: var(--amber-soft); }
+    .status.cancelled { color: var(--rose); background: var(--rose-soft); }
+
+    .lanes {
+      display: grid;
+      gap: 1.5rem;
+      padding-top: 2rem;
+    }
+
+    .lane {
+      padding: 1.25rem;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    .lane-kicker {
+      color: var(--quiet);
+      font-size: 0.75rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .lane h3 {
+      padding-top: 0.5rem;
+      font-size: 1.125rem;
+    }
+
+    .lane p {
+      padding-top: 0.75rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.6;
+      text-wrap: pretty;
+    }
+
+    .lane-sequence {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.5rem;
+      padding-top: 1rem;
+      color: var(--quiet);
+      font-size: 0.8125rem;
+    }
+
+    .lane-step {
+      padding: 0.4rem 0.55rem;
+      border-radius: 0.375rem;
+      background: var(--well);
+      color: var(--text);
+    }
+
+    .code-map {
+      display: grid;
+      gap: 0;
+      margin-top: 2rem;
+      border-top: 1px solid var(--line);
+    }
+
+    .code-map-row {
+      display: grid;
+      gap: 0.375rem;
+      padding-block: 1rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .code-map-row a {
+      color: var(--accent);
+      font-size: 0.875rem;
+      text-decoration: none;
+    }
+
+    .code-map-row p {
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+
+    footer {
+      display: grid;
+      gap: 1rem;
+      margin-top: 4rem;
+      padding-top: 1.5rem;
+      border-top: 1px solid var(--line);
+      color: var(--quiet);
+      font-size: 1rem;
+      line-height: 1.55;
+    }
+
+    .references {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1rem;
+    }
+
+    @media (min-width: 40rem) {
+      .topbar-inner,
+      .page { padding-inline: 1.5rem; }
+
+      .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+      .detail-grid,
+      .gates,
+      .lanes,
+      .code-map-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+      .architecture { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+      .stage-subtitle,
+      footer { font-size: 0.8125rem; }
+
+      .architecture-node p:last-child,
+      .outcomes td,
+      .code-map-row p { font-size: 0.875rem; }
+
+      .detail-block ul,
+      .gate > p,
+      .lane p { font-size: 0.9375rem; }
+    }
+
+    @media (min-width: 64rem) {
+      .topbar-inner,
+      .page { padding-inline: 2rem; }
+
+      .hero { grid-template-columns: minmax(0, 3fr) minmax(18rem, 2fr); }
+      .hero-main { align-self: end; }
+
+      .flow-rail { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+
+      .stage {
+        grid-template-columns: 1fr;
+        align-content: start;
+        min-height: 8.5rem;
+      }
+
+      .stage:not(:last-child)::after {
+        position: absolute;
+        z-index: -1;
+        top: 1.75rem;
+        left: calc(100% + 1px);
+        width: 0.75rem;
+        height: 1px;
+        background: var(--line-strong);
+        content: "";
+      }
+
+      .stage-detail { grid-template-columns: minmax(0, 4fr) minmax(19rem, 3fr); }
+      .detail-grid { grid-template-columns: 1fr; }
+      .architecture { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+      .gates { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .lanes { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .code-map-row { grid-template-columns: minmax(13rem, 1fr) 3fr; }
+      footer { grid-template-columns: minmax(16rem, 1fr) 2fr; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="../README.md" aria-label="Open the Gaston README">
+          <img src="assets/gaston-logo.png" alt="">
+          <span class="brand-name">Gaston</span>
+        </a>
+        <span class="topbar-label mono">Reviewbot flow · code-derived</span>
+      </div>
+    </header>
+
+    <main class="page">
+      <section class="hero" aria-labelledby="page-title">
+        <div class="hero-main">
+          <p class="eyebrow mono">Architecture walkthrough</p>
+          <h1 id="page-title">How a pull request becomes a trusted review.</h1>
+          <p class="hero-copy">Gaston is a queue-driven GitHub App built around a strict separation of duties: one model pass discovers plausible bugs, a fresh pass tries to falsify them, and deterministic code decides what GitHub is allowed to see.</p>
+        </div>
+        <aside class="invariant">
+          <p class="invariant-label mono">The governing rule</p>
+          <p>Discovery may propose. Verification must prove. The harness alone publishes.</p>
+        </aside>
+      </section>
+
+      <div class="stats" aria-label="Review flow summary">
+        <div class="stat">
+          <p class="stat-value">6</p>
+          <p class="stat-label">happy-path phases</p>
+        </div>
+        <div class="stat">
+          <p class="stat-value">2</p>
+          <p class="stat-label">independent model roles</p>
+        </div>
+        <div class="stat">
+          <p class="stat-value">0</p>
+          <p class="stat-label">pull request code executions</p>
+        </div>
+        <div class="stat">
+          <p class="stat-value">8</p>
+          <p class="stat-label">evidence calls per phase, maximum</p>
+        </div>
+      </div>
+
+      <section aria-labelledby="pipeline-title">
+        <div class="section-heading">
+          <h2 id="pipeline-title">Follow the review pipeline.</h2>
+          <p>Select a stage to see what it owns, which checks guard it, and where that behavior lives in the repository.</p>
+        </div>
+
+        <div class="flow-rail" role="tablist" aria-label="Review pipeline stages">
+          <button class="stage" id="stage-admit" type="button" role="tab" aria-selected="true" aria-controls="stage-detail" data-stage="admit">
+            <span class="stage-index mono">01</span>
+            <span>
+              <span class="stage-title">Admit</span>
+              <span class="stage-subtitle">Verify and classify the GitHub event.</span>
+            </span>
+          </button>
+          <button class="stage" id="stage-claim" type="button" role="tab" aria-selected="false" aria-controls="stage-detail" data-stage="claim" tabindex="-1">
+            <span class="stage-index mono">02</span>
+            <span>
+              <span class="stage-title">Queue &amp; claim</span>
+              <span class="stage-subtitle">Give the latest request durable ownership.</span>
+            </span>
+          </button>
+          <button class="stage" id="stage-load" type="button" role="tab" aria-selected="false" aria-controls="stage-detail" data-stage="load" tabindex="-1">
+            <span class="stage-index mono">03</span>
+            <span>
+              <span class="stage-title">Load evidence</span>
+              <span class="stage-subtitle">Build a bounded, read-only workspace.</span>
+            </span>
+          </button>
+          <button class="stage" id="stage-discover" type="button" role="tab" aria-selected="false" aria-controls="stage-detail" data-stage="discover" tabindex="-1">
+            <span class="stage-index mono">04</span>
+            <span>
+              <span class="stage-title">Discover</span>
+              <span class="stage-subtitle">Generate falsifiable bug candidates.</span>
+            </span>
+          </button>
+          <button class="stage" id="stage-verify" type="button" role="tab" aria-selected="false" aria-controls="stage-detail" data-stage="verify" tabindex="-1">
+            <span class="stage-index mono">05</span>
+            <span>
+              <span class="stage-title">Verify</span>
+              <span class="stage-subtitle">Cold-check every candidate and citation.</span>
+            </span>
+          </button>
+          <button class="stage" id="stage-publish" type="button" role="tab" aria-selected="false" aria-controls="stage-detail" data-stage="publish" tabindex="-1">
+            <span class="stage-index mono">06</span>
+            <span>
+              <span class="stage-title">Publish</span>
+              <span class="stage-subtitle">Apply policy and update GitHub.</span>
+            </span>
+          </button>
+        </div>
+
+        <div class="stage-detail" id="stage-detail" role="tabpanel" aria-labelledby="stage-admit" aria-live="polite">
+          <div>
+            <p class="detail-position mono" id="detail-position">Stage 01 · admission boundary</p>
+            <h3 class="detail-title" id="detail-title">Only authenticated, relevant GitHub events enter the queue.</h3>
+            <p class="detail-summary" id="detail-summary">The Worker accepts POST requests only, caps the body at 2 MB, verifies the HMAC-SHA256 signature in constant time, parses known event shapes, and ignores drafts or unrelated actions before any inference can happen.</p>
+          </div>
+          <div class="detail-grid">
+            <div class="detail-block">
+              <h3>What passes</h3>
+              <ul id="detail-points" role="list">
+                <li>Opened, reopened, synchronized, or ready-for-review pull requests.</li>
+                <li>Trusted owner, member, or collaborator comments containing <code>@gaston</code>.</li>
+                <li>Manual requests are acknowledged with an eyes reaction after enqueue.</li>
+              </ul>
+            </div>
+            <div class="detail-block">
+              <h3>Code trail</h3>
+              <div class="source-links" id="detail-sources">
+                <a class="source-link mono" href="../src/webhook.ts">webhook.ts:19–91</a>
+                <a class="source-link mono" href="../src/types.ts">types.ts:1–6</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="system-title">
+        <div class="section-heading">
+          <h2 id="system-title">The system boundary at a glance.</h2>
+          <p>The webhook request stays short. Queue delivery, ownership, repository reads, model work, and GitHub writes happen behind it.</p>
+        </div>
+        <div class="architecture" aria-label="System components in order">
+          <div class="architecture-node">
+            <p class="mono">Input</p>
+            <h3>GitHub</h3>
+            <p>Webhook, PR state, changed files, checks, exact-SHA archives, trees, and file contents.</p>
+          </div>
+          <div class="architecture-node">
+            <p class="mono">Admission</p>
+            <h3>Worker</h3>
+            <p>Authenticates, classifies, and enqueues without running inference.</p>
+          </div>
+          <div class="architecture-node">
+            <p class="mono">Buffer</p>
+            <h3>Cloudflare Queue</h3>
+            <p>Moves long work off the webhook and supports retry plus dead-lettering.</p>
+          </div>
+          <div class="architecture-node accent">
+            <p class="mono">Owner</p>
+            <h3>Per-PR Durable Object</h3>
+            <p>Serializes live work and makes “latest accepted request wins” durable.</p>
+          </div>
+          <div class="architecture-node">
+            <p class="mono">Evidence</p>
+            <h3>Computer workspace</h3>
+            <p>Stores a bounded immutable head snapshot plus lazy base reads; exposes no shell and executes no PR code.</p>
+          </div>
+          <div class="architecture-node">
+            <p class="mono">Reasoning</p>
+            <h3>OpenRouter model</h3>
+            <p>Runs separate discovery and verification contexts over bounded tools.</p>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="gates-title">
+        <div class="section-heading">
+          <h2 id="gates-title">Four gates prevent a speculative comment.</h2>
+          <p>A candidate has to survive every gate. Failure at any one does not become a clean verdict; it becomes withheld or incomplete.</p>
+        </div>
+        <div class="gates">
+          <article class="gate">
+            <p class="gate-number mono">Gate 01</p>
+            <h3>Changed-line anchor</h3>
+            <p>The proposed path, side, and line must exist in GitHub’s exact per-file patch.</p>
+            <div class="chips"><span class="chip stop">invalid anchor → drop</span></div>
+          </article>
+          <article class="gate">
+            <p class="gate-number mono">Gate 02</p>
+            <h3>Independent verdict</h3>
+            <p>Exactly one verifier verdict must match the harness-owned candidate identity and anchor.</p>
+            <div class="chips"><span class="chip warn">missing or duplicate → insufficient</span></div>
+          </article>
+          <article class="gate">
+            <p class="gate-number mono">Gate 03</p>
+            <h3>Complete evidence</h3>
+            <p>Every cited opaque handle must exist in the verifier’s own completed evidence ledger, including the changed anchor.</p>
+            <div class="chips"><span class="chip warn">unknown scope → insufficient</span></div>
+          </article>
+          <article class="gate">
+            <p class="gate-number mono">Gate 04</p>
+            <h3>Publication policy</h3>
+            <p>A confirmed finding still needs confidence ≥ 0.80, deduplication, a valid changed line, and room under the finding cap.</p>
+            <div class="chips"><span class="chip good">eligible → publish</span></div>
+          </article>
+        </div>
+      </section>
+
+      <section aria-labelledby="outcomes-title">
+        <div class="section-heading">
+          <h2 id="outcomes-title">What GitHub finally receives.</h2>
+          <p>Gaston uses the check conclusion to distinguish “proved clean” from “finished, but not safe to call clean.”</p>
+        </div>
+        <div class="branch-wrap">
+          <table class="outcomes">
+            <thead>
+              <tr>
+                <th scope="col">Terminal state</th>
+                <th scope="col">Inline review</th>
+                <th scope="col">Check conclusion</th>
+                <th scope="col">Meaning</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>Clean + complete</td>
+                <td>None</td>
+                <td><span class="status success">success</span></td>
+                <td>No actionable bug survived and repository evidence is sufficient.</td>
+              </tr>
+              <tr>
+                <td>Verified findings</td>
+                <td>Changed-line comments, once per comparison</td>
+                <td><span class="status neutral">neutral</span></td>
+                <td>One or more high-confidence findings passed all publication gates.</td>
+              </tr>
+              <tr>
+                <td>Incomplete evidence</td>
+                <td>Only independently confirmed eligible findings</td>
+                <td><span class="status neutral">neutral</span></td>
+                <td>Unresolved candidates or coverage gaps prevent a green clean-review claim.</td>
+              </tr>
+              <tr>
+                <td>Budget exhausted</td>
+                <td>None</td>
+                <td><span class="status neutral">neutral</span></td>
+                <td>The run stops safely without publishing a partial or speculative review.</td>
+              </tr>
+              <tr>
+                <td>Superseded head</td>
+                <td>Stale publication is blocked or reconciled</td>
+                <td><span class="status cancelled">cancelled</span></td>
+                <td>A newer accepted request owns the PR and receives a fresh cumulative review.</td>
+              </tr>
+              <tr>
+                <td>Permanent failure</td>
+                <td>None</td>
+                <td><span class="status cancelled">failure</span></td>
+                <td>The review did not complete; the check reports the error instead of implying success.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section aria-labelledby="resilience-title">
+        <div class="section-heading">
+          <h2 id="resilience-title">The side lanes are part of the main design.</h2>
+          <p>Freshness, retries, and resource limits are all enforced with persisted state, not left to best-effort model behavior.</p>
+        </div>
+        <div class="lanes">
+          <article class="lane">
+            <p class="lane-kicker mono">Latest head wins</p>
+            <h3>Supersession</h3>
+            <p>A newer durable claim increments the generation, aborts older in-memory work, cancels its check, and prevents stale side effects by checking ownership before and after every GitHub write.</p>
+            <div class="lane-sequence">
+              <span class="lane-step">new SHA</span><span>→</span><span class="lane-step">new generation</span><span>→</span><span class="lane-step">abort old run</span>
+            </div>
+          </article>
+          <article class="lane">
+            <p class="lane-kicker mono">Same budget, same check</p>
+            <h3>Transient retry</h3>
+            <p>Retryable GitHub, network, or provider failures preserve checkpoints and budget usage. Queue retries back off at 5, 15, and 45 seconds before dead-letter handling.</p>
+            <div class="lane-sequence">
+              <span class="lane-step">5s</span><span>→</span><span class="lane-step">15s</span><span>→</span><span class="lane-step">45s</span><span>→</span><span class="lane-step">DLQ</span>
+            </div>
+          </article>
+          <article class="lane">
+            <p class="lane-kicker mono">Fail closed</p>
+            <h3>Resource budget</h3>
+            <p>The shared run budget covers wall time, model requests, tokens, and cost. Usage is persisted before provider work leaves the Durable Object; exhaustion produces a neutral terminal check.</p>
+            <div class="lane-sequence">
+              <span class="lane-step">14 min</span><span>·</span><span class="lane-step">15 requests</span><span>·</span><span class="lane-step">$0.20</span>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section aria-labelledby="map-title">
+        <div class="section-heading">
+          <h2 id="map-title">Where to read the implementation.</h2>
+          <p>This map follows responsibility boundaries rather than file size.</p>
+        </div>
+        <div class="code-map">
+          <div class="code-map-row">
+            <a class="mono" href="../src/webhook.ts">src/webhook.ts</a>
+            <p>Webhook authentication, event filtering, manual command authorization, and enqueue.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/index.ts">src/index.ts</a>
+            <p>Worker routes, queue consumption, manual job resolution, retry, and Durable Object routing.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/coordinator.ts">src/coordinator.ts</a>
+            <p>Durable latest-request-wins generations and lease-guarded external operations.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/reviewer.ts">src/reviewer.ts</a>
+            <p>End-to-end orchestration, phase transitions, checkpoints, supersession, and publication ordering.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/repository.ts">src/repository.ts</a>
+            <p>Read-only evidence workspace, immutable caching, bounded tools, policy loading, and coverage tracking.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/agent.ts">src/agent.ts</a>
+            <p>Provider loop, evidence-call budgets, recovery turns, structured output, and context handling.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/verification-pipeline.ts">src/verification-pipeline.ts</a>
+            <p>Candidate tagging, cold verifier execution, optional evidence rescue, and deterministic replay boundary.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/review-core.ts">src/review-core.ts</a>
+            <p>Changed-line validation, verdict reduction, confidence thresholds, candidate fates, and publication policy.</p>
+          </div>
+          <div class="code-map-row">
+            <a class="mono" href="../src/github.ts">src/github.ts</a>
+            <p>GitHub reads, check lifecycle, review comments, summaries, deduplication, and stale-write reconciliation.</p>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <p>Derived from the current repository state on 2026-08-15. Repository code is the source of truth; external references informed the presentation pattern, not Gaston’s behavior.</p>
+        <div class="references" aria-label="External references">
+          <a class="reference-link" href="https://docs.github.com/enterprise-cloud@latest/apps/creating-github-apps/writing-code-for-a-github-app/building-ci-checks-with-a-github-app">GitHub App check-run guide</a>
+          <a class="reference-link" href="https://docs.github.com/webhooks/webhook-events-and-payloads">GitHub webhook events</a>
+          <a class="reference-link" href="https://docs.github.com/en/repositories/working-with-files/using-files/downloading-source-code-archives">GitHub source archives</a>
+          <a class="reference-link" href="https://git-scm.com/docs/git-archive">Git archive attributes</a>
+          <a class="reference-link" href="https://vercel.com/kb/guide/ship-a-github-code-review-bot-with-hono-and-redis">Vercel review-bot walkthrough</a>
+          <a class="reference-link" href="https://github.com/reviewdog/reviewdog">reviewdog reporters</a>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <script>
+    const stages = {
+      admit: {
+        position: "Stage 01 · admission boundary",
+        title: "Only authenticated, relevant GitHub events enter the queue.",
+        summary: "The Worker accepts POST requests only, caps the body at 2 MB, verifies the HMAC-SHA256 signature in constant time, parses known event shapes, and ignores drafts or unrelated actions before any inference can happen.",
+        points: [
+          "Opened, reopened, synchronized, or ready-for-review pull requests.",
+          "Trusted owner, member, or collaborator comments containing @gaston.",
+          "Manual requests are acknowledged with an eyes reaction after enqueue."
+        ],
+        sources: [
+          ["webhook.ts:19–91", "../src/webhook.ts"],
+          ["types.ts:1–6", "../src/types.ts"]
+        ]
+      },
+      claim: {
+        position: "Stage 02 · durable ownership",
+        title: "The queue routes one PR to one latest-request-wins coordinator.",
+        summary: "The consumer resolves manual requests to the current base/head, names a Durable Object by repository and PR, and claims a monotonically increasing generation. Duplicate work reuses a promise or checkpoint; older requests lose ownership.",
+        points: [
+          "A queued GitHub check appears as soon as the durable claim succeeds.",
+          "The PR is re-read before claim so closed, draft, or changed heads stop as stale.",
+          "A new claim aborts older model calls, retry delays, and evidence reads."
+        ],
+        sources: [
+          ["index.ts:38–94", "../src/index.ts"],
+          ["reviewer.ts:113–273", "../src/reviewer.ts"],
+          ["coordinator.ts:45–149", "../src/coordinator.ts"]
+        ]
+      },
+      load: {
+        position: "Stage 03 · repository evidence",
+        title: "Gaston builds context without cloning or executing the pull request.",
+        summary: "It fetches the cumulative base-to-head changed-file inventory and a history-free source archive for the exact head. Every archive path is reconciled against the exact Git tree before a validated, size-bounded snapshot is committed into Computer; policy still comes from the immutable base commit.",
+        points: [
+          "Tools cover changed files, exact patch slices, trees, files, literal search, and pinned dependency source.",
+          "The model sees the same bounded read tools—never a shell—even though search can cover the local exact-head snapshot.",
+          "Export-transformed, oversized, or unsupported repositories fall back to exact GitHub reads; truncation and missing patches remain explicit."
+        ],
+        sources: [
+          ["reviewer.ts:937–1016", "../src/reviewer.ts"],
+          ["repository.ts:40–301", "../src/repository.ts"],
+          ["repository-snapshot.ts", "../src/repository-snapshot.ts"],
+          ["github.ts:207–339", "../src/github.ts"]
+        ]
+      },
+      discover: {
+        position: "Stage 04 · recall-oriented reasoning",
+        title: "The discovery pass proposes concrete, falsifiable bug candidates.",
+        summary: "When the complete changed code fits the prompt, discovery can run directly. Otherwise the model gets one broad evidence batch of up to four parallel calls, narrowly scoped recovery when needed, and a phase-wide ceiling of eight executed evidence calls.",
+        points: [
+          "Every candidate includes a changed-line anchor, severity, confidence, causal explanation, evidence, and suggested fix.",
+          "Deterministic code immediately drops malformed, duplicate, or non-changed-line candidates.",
+          "If discovery finds nothing, verification is skipped; incomplete coverage still prevents a green claim."
+        ],
+        sources: [
+          ["agent.ts:240–755", "../src/agent.ts"],
+          ["reviewer.ts:1028–1077", "../src/reviewer.ts"],
+          ["review-core.ts:127–151", "../src/review-core.ts"]
+        ]
+      },
+      verify: {
+        position: "Stage 05 · precision boundary",
+        title: "A fresh verifier tries to disprove each discovery candidate.",
+        summary: "The harness assigns candidate IDs, prefetches exact anchors, replaces raw evidence identities with opaque handles, and runs a cold verification context. Each verdict must be confirmed, refuted, or insufficient and cite complete verifier-local proof.",
+        points: [
+          "Discovery reads cannot masquerade as independent verification evidence.",
+          "Missing, duplicate, malformed, mismatched, or unsupported verdicts fail closed as insufficient.",
+          "Routeable unresolved candidates may receive one bounded, batched evidence-completion pass."
+        ],
+        sources: [
+          ["verification-pipeline.ts:120–269", "../src/verification-pipeline.ts"],
+          ["review-core.ts:263–478", "../src/review-core.ts"],
+          ["verification-evidence.ts", "../src/verification-evidence.ts"]
+        ]
+      },
+      publish: {
+        position: "Stage 06 · deterministic side effects",
+        title: "Only policy-eligible confirmations are published to GitHub.",
+        summary: "The harness reapplies the confidence threshold, changed-line validation, deduplication, and finding cap. It then serializes an inline review, summary upsert, and terminal check while verifying durable ownership before and after each external write.",
+        points: [
+          "Blockers request changes by default; other findings publish as comments.",
+          "A truly clean, fully covered run gets success; findings or incomplete evidence get neutral.",
+          "Ambiguous stale writes are looked up and reconciled using execution-scoped markers."
+        ],
+        sources: [
+          ["reviewer.ts:569–738", "../src/reviewer.ts"],
+          ["review-core.ts:504–633", "../src/review-core.ts"],
+          ["github.ts:501–761", "../src/github.ts"]
+        ]
+      }
+    };
+
+    const tabs = [...document.querySelectorAll("[data-stage]")];
+    const detail = document.querySelector("#stage-detail");
+    const position = document.querySelector("#detail-position");
+    const title = document.querySelector("#detail-title");
+    const summary = document.querySelector("#detail-summary");
+    const points = document.querySelector("#detail-points");
+    const sources = document.querySelector("#detail-sources");
+
+    function selectStage(tab, moveFocus = false) {
+      const data = stages[tab.dataset.stage];
+      tabs.forEach((candidate) => {
+        const selected = candidate === tab;
+        candidate.setAttribute("aria-selected", String(selected));
+        candidate.tabIndex = selected ? 0 : -1;
+      });
+      detail.setAttribute("aria-labelledby", tab.id);
+      position.textContent = data.position;
+      title.textContent = data.title;
+      summary.textContent = data.summary;
+      points.replaceChildren(...data.points.map((point) => {
+        const item = document.createElement("li");
+        item.textContent = point;
+        return item;
+      }));
+      sources.replaceChildren(...data.sources.map(([label, href]) => {
+        const link = document.createElement("a");
+        link.className = "source-link mono";
+        link.href = href;
+        link.textContent = label;
+        return link;
+      }));
+      if (moveFocus) tab.focus();
+    }
+
+    tabs.forEach((tab, index) => {
+      tab.addEventListener("click", () => selectStage(tab));
+      tab.addEventListener("keydown", (event) => {
+        if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(event.key)) return;
+        event.preventDefault();
+        const nextIndex = event.key === "Home"
+          ? 0
+          : event.key === "End"
+            ? tabs.length - 1
+            : (index + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) + tabs.length) % tabs.length;
+        selectStage(tabs[nextIndex], true);
+      });
+    });
+  </script>
+</body>
+</html>

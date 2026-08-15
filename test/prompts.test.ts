@@ -25,6 +25,8 @@ describe("review prompt budgets", () => {
     expect(prompt).toContain("normalization and validation asymmetry");
     expect(prompt).toContain("permission composition and trust boundaries");
     expect(prompt).toContain("one explicit repository fact remains to be checked by the verifier");
+    expect(prompt).toContain('"proofObligations"');
+    expect(prompt).toContain('"falsifier"');
   });
 
   it("bounds oversized verification candidates without losing the output contract", () => {
@@ -77,9 +79,10 @@ describe("review prompt budgets", () => {
     expect(prompt).toContain('"evidenceScopes"');
     expect(prompt).toContain("A lack of proof is `insufficient`, never `refuted`");
     expect(prompt).toContain("Executable tests, benchmarks, workflows, and manifests remain eligible");
-    expect(prompt).toContain("absence of a guard is not proof that the trigger is reachable");
+    expect(prompt).toContain("absence of a guard alone is not proof");
+    expect(prompt).toContain("can establish reachability without production telemetry");
     expect(prompt).toContain("prove every causal link from repository evidence");
-    expect(prompt).toContain("pinned implementation or an executable repository contract");
+    expect(prompt).toContain("Require pinned source or an executable contract for non-obvious");
     expect(prompt).toContain("anchor-1-");
     expect(prompt).toContain("anchor-2-");
     expect(prompt).toContain("diff_for_file:src/0.ts:source:RIGHT:1");
@@ -103,6 +106,14 @@ describe("review prompt budgets", () => {
             evidence: "The changed guard requires both roles.",
             suggestedFix: "Use ||.",
             confidence: 0.98,
+            proofObligations: {
+              trigger: "admin-only member",
+              changedBehavior: "requires both roles",
+              executionPath: "authorization guard",
+              observableFailure: "valid admin is rejected",
+              falsifier: "all admins are owners",
+              unresolvedFact: "",
+            },
           }],
         },
       }],
@@ -133,6 +144,9 @@ describe("review prompt budgets", () => {
     expect(prompt).toContain("diff_for_file:src/permissions.ts:source:RIGHT:48");
     expect(prompt).toContain("+const allowed = isAdmin && isOwner;");
     expect(prompt).toContain("Spend verifier tool calls on callers, guards, schemas, and invariants beyond these anchors");
+    expect(prompt).not.toContain('"trigger": "admin-only member"');
+    expect(prompt).not.toContain('"falsifier": "all admins are owners"');
+    expect(prompt).toContain('"falsificationTarget": "all admins are owners"');
   });
 
   it("keeps verifier input blind to discovery rationale and confidence", () => {
@@ -167,6 +181,43 @@ describe("review prompt budgets", () => {
     expect(prompt).not.toContain("discovery-secret-evidence-claim");
     expect(prompt).not.toContain("discovery-secret-proposed-fix");
     expect(prompt).not.toContain("0.987654");
+  });
+
+  it("discloses the causal hypothesis only in a focused post-blind rescue", () => {
+    const discoveries = [{
+      source: "discovery",
+      review: {
+        summary: "candidate",
+        findings: [{
+          path: "src/permissions.ts",
+          line: 48,
+          side: "RIGHT" as const,
+          severity: "high" as const,
+          title: "[GASTON-CANDIDATE-1] admin requires owner",
+          why: "the changed conjunction rejects admin-only members",
+          evidence: "the caller permits either role",
+          suggestedFix: "restore the disjunction",
+          confidence: 0.98,
+        }],
+      },
+    }];
+    const prompt = verificationPrompt(job(), discoveries, changes(""), "", [], {
+      candidateId: "GASTON-CANDIDATE-1",
+      missingEvidenceKind: "repository_symbol",
+      missingEvidence: "Whether the caller permits either role.",
+      discoveryHypothesis: {
+        why: discoveries[0]!.review.findings[0]!.why,
+        evidence: discoveries[0]!.review.findings[0]!.evidence,
+      },
+      dossier: [],
+      routingEvidence: [],
+    });
+
+    expect(prompt).toContain("disclosed only after the blind first pass");
+    expect(prompt).toContain("the changed conjunction rejects admin-only members");
+    expect(prompt).toContain("the caller permits either role");
+    expect(prompt).not.toContain("restore the disjunction");
+    expect(prompt).not.toContain("0.98");
   });
 
   it("reports the number of file rows that are actually visible", () => {

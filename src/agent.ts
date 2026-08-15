@@ -16,6 +16,7 @@ const MAX_TOOL_CALLS_PER_PHASE = MAX_TOOL_CALLS_PER_BATCH
 const MAX_CARRIED_CONTEXT_BYTES = 120_000;
 const INITIAL_OUTPUT_TOKEN_LIMIT = 32_000;
 export const DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST = 64_000;
+export const DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST = 48_000;
 
 type Message =
   | { role: "system" | "user"; content: string }
@@ -1554,6 +1555,23 @@ const TOOL_DEFINITIONS = [
       },
     },
   },
+  {
+    type: "function",
+    function: {
+      name: "dependency_source",
+      description: "Search source from a dependency pinned by the exact PR-head uv.lock or pnpm-lock.yaml. The harness verifies the locked package hash/integrity and any pnpm patch hash, restricts registry hosts, and never executes package code. Use this when a verdict depends on an external type, parser, field, or provider-normalization contract; package must be the normalized lockfile package name.",
+      parameters: {
+        type: "object",
+        properties: {
+          package: { type: "string" },
+          query: { type: "string" },
+          limit: { type: "integer", minimum: 1, maximum: 20 },
+        },
+        required: ["package", "query"],
+        additionalProperties: false,
+      },
+    },
+  },
 ] as const;
 
 const PATCH_RECOVERY_TOOL_DEFINITIONS = TOOL_DEFINITIONS.filter((definition) => (
@@ -1577,8 +1595,8 @@ Security boundary:
 
 Exploration discipline:
 - You have ${maxExplorationTurns === 1 ? "one bounded evidence-gathering turn" : "one broad evidence turn and one optional targeted follow-up"} before finalization. Request at most four high-value reads/searches in the first turn.
-- When that turn only discovers concrete paths through changed_files, the harness may offer one patch-only continuation within the same six-call evidence budget.
-- A truncated result may trigger a two-call recovery batch. Any inventory or recovery patch batch whose exact metadata advertises a new uncovered continuation may unlock the next patch-only recovery round; there are at most ${MAX_RECOVERY_ROUNDS} recovery rounds and six model-controlled evidence calls phase-wide. Harness-prefetched verifier anchors do not consume those model-controlled calls.
+- When that turn only discovers concrete paths through changed_files, the harness may offer one patch-only continuation within the same ${MAX_TOOL_CALLS_PER_PHASE}-call evidence budget.
+- A truncated result may trigger a two-call recovery batch. Any inventory or recovery patch batch whose exact metadata advertises a new uncovered continuation may unlock the next patch-only recovery round; there are at most ${MAX_RECOVERY_ROUNDS} recovery rounds and ${MAX_TOOL_CALLS_PER_PHASE} model-controlled evidence calls phase-wide. Harness-prefetched verifier anchors do not consume those model-controlled calls.
 - Prioritize the riskiest plausible failure paths; do not exhaustively browse low-risk files.
 - Stop when the harness ends the bounded evidence pass and return the best proven result. Budget exhaustion is not permission to speculate.
 - Prefer new evidence over repeated reads; identical tool results are reused and old outputs may be compacted after use.
@@ -1684,8 +1702,28 @@ const REVIEW_RESPONSE_FORMAT = {
               evidence: { type: "string" },
               suggestedFix: { type: "string" },
               confidence: { type: "number", minimum: 0, maximum: 1 },
+              proofObligations: {
+                type: "object",
+                properties: {
+                  trigger: { type: "string" },
+                  changedBehavior: { type: "string" },
+                  executionPath: { type: "string" },
+                  observableFailure: { type: "string" },
+                  falsifier: { type: "string" },
+                  unresolvedFact: { type: "string" },
+                },
+                required: [
+                  "trigger",
+                  "changedBehavior",
+                  "executionPath",
+                  "observableFailure",
+                  "falsifier",
+                  "unresolvedFact",
+                ],
+                additionalProperties: false,
+              },
             },
-            required: ["path", "line", "side", "severity", "title", "why", "evidence", "suggestedFix", "confidence"],
+            required: ["path", "line", "side", "severity", "title", "why", "evidence", "suggestedFix", "confidence", "proofObligations"],
             additionalProperties: false,
           },
         },
@@ -1725,6 +1763,23 @@ const VERIFICATION_RESPONSE_FORMAT = {
                 type: "array",
                 items: { type: "string" },
               },
+              missingEvidenceKind: {
+                anyOf: [
+                  {
+                    type: "string",
+                    enum: [
+                      "repository_reachability",
+                      "repository_symbol",
+                      "dependency_contract",
+                      "runtime_semantics",
+                      "tool_failure",
+                      "unknown",
+                    ],
+                  },
+                  { type: "null" },
+                ],
+              },
+              missingEvidence: { type: "string" },
             },
             required: [
               "candidateId",
@@ -1737,6 +1792,8 @@ const VERIFICATION_RESPONSE_FORMAT = {
               "evidence",
               "evidenceComplete",
               "evidenceScopes",
+              "missingEvidenceKind",
+              "missingEvidence",
             ],
             additionalProperties: false,
           },

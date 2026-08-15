@@ -30,7 +30,7 @@ export interface ReportedModelUsage {
 
 export const DEFAULT_REVIEW_BUDGET: ReviewBudgetLimits = {
   maxWallTimeMs: 14 * 60_000,
-  maxModelRequests: 9,
+  maxModelRequests: 15,
   maxEstimatedInputTokens: 250_000,
   maxOutputTokens: 128_000,
   maxCostUsd: 0.20,

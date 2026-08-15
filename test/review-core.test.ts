@@ -238,6 +238,17 @@ describe("tri-state verification", () => {
       }),
     ]);
     expect(resolution.confirmedCandidateIds).toEqual(["GASTON-CANDIDATE-1"]);
+    expect(resolution.candidateFates).toEqual([
+      expect.objectContaining({
+        candidateId: "GASTON-CANDIDATE-1",
+        verification: expect.objectContaining({
+          state: "confirmed",
+          reason: "confirmed",
+          confidence: 0.94,
+        }),
+        publication: { state: "pending", reason: null },
+      }),
+    ]);
     expect(resolution.incomplete).toBe(false);
   });
 
@@ -255,6 +266,8 @@ describe("tri-state verification", () => {
         verdict: "insufficient",
         evidenceComplete: false,
         evidenceScopes: [],
+        missingEvidenceKind: "repository_reachability",
+        missingEvidence: "Whether the production caller reaches this branch.",
       }),
     ]), [tagged], completedScopes());
 
@@ -281,6 +294,10 @@ describe("tri-state verification", () => {
     expect(resolution.insufficientCandidateIds).toEqual([
       "GASTON-CANDIDATE-1",
       "GASTON-CANDIDATE-2",
+    ]);
+    expect(resolution.candidateFates.map((entry) => entry.verification.reason)).toEqual([
+      "duplicate_verdict",
+      "missing_verdict",
     ]);
   });
 
@@ -597,6 +614,10 @@ describe("tri-state verification", () => {
       incomplete: true,
       withheldConfirmedCandidateCount: 1,
     });
+    expect(publication.resolution.candidateFates[0]?.publication).toEqual({
+      state: "withheld",
+      reason: "below_confidence",
+    });
     expect(publication.coverage.sufficient).toBe(false);
   });
 
@@ -672,6 +693,10 @@ describe("tri-state verification", () => {
 
     expect(publication.review.findings.map((entry) => entry.title)).toEqual(["first confirmation"]);
     expect(publication.resolution.withheldConfirmedCandidateCount).toBe(1);
+    expect(publication.resolution.candidateFates.map((entry) => entry.publication)).toEqual([
+      { state: "published", reason: "published" },
+      { state: "withheld", reason: "finding_cap" },
+    ]);
     expect(publication.coverage.sufficient).toBe(false);
   });
 
@@ -764,6 +789,8 @@ function verdict(candidateId: string, overrides: Record<string, unknown> = {}) {
     evidence: "repository evidence",
     evidenceComplete: true,
     evidenceScopes: ["diff_for_file:src/a.ts"],
+    missingEvidenceKind: null,
+    missingEvidence: "",
     ...overrides,
   };
 }

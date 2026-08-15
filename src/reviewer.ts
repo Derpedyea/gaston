@@ -9,6 +9,7 @@ import {
 
 import {
   DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
+  DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST,
   ReviewAgent,
   reviewProviderRouteFromEnv,
 } from "./agent.ts";
@@ -32,15 +33,12 @@ import {
 } from "./coordinator.ts";
 import { GitHubClient, type ReviewComparisonIdentity } from "./github.ts";
 import { errorMessage, logError, logInfo } from "./log.ts";
-import { discoveryPrompt, REVIEW_LENS, verificationPrompt } from "./prompts.ts";
+import { discoveryPrompt, REVIEW_LENS } from "./prompts.ts";
 import {
-  finalizeVerificationPublication,
   filterFindings,
   parseChangedFileLines,
   reconcileCleanRerunWithPriorReview,
-  resolveVerificationVerdicts,
   shouldUseDirectDiscovery,
-  tagVerificationCandidates,
 } from "./review-core.ts";
 import {
   RepositoryTools,
@@ -55,10 +53,7 @@ import type {
   StoredReviewSession,
 } from "./session.ts";
 import type { Env, Finding, ReviewJob, ReviewOutcome, ReviewOutput } from "./types.ts";
-import {
-  prefetchVerificationAnchors,
-  withOpaqueEvidenceHandles,
-} from "./verification-evidence.ts";
+import { verifyAndPublish } from "./verification-pipeline.ts";
 
 export { WorkspaceProxy };
 
@@ -955,8 +950,12 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       github.getOtherChecks(job, signal),
     ]);
     using workspace = await getWorkspace(this);
-    const repository = new RepositoryWorkspace(workspace, github, job, changes);
-    await repository.initialize(checks);
+    const repository = new RepositoryWorkspace(workspace, github, job, changes, { snapshot: true });
+    await repository.initialize(checks, signal);
+    logInfo("review.repository_snapshot", {
+      ...reviewLogFields(job),
+      ...repository.snapshotReport(),
+    });
     if (!(await this.#updateSession(lease, {
       artifactsReady: true,
       progressTitle: "Loaded cumulative pull request changes",
@@ -971,7 +970,13 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       this.env.REVIEW_PROVIDER,
       this.env.REVIEW_REQUIRE_ZDR,
     );
-    const agent = new ReviewAgent({
+    const maxOutputTokensPerRequest = Math.round(boundedNumber(
+      this.env.REVIEW_MODEL_MAX_OUTPUT_TOKENS,
+      DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
+      2_000,
+      384_000,
+    ));
+    const agentOptions = {
       apiKey: this.env.OPENROUTER_API_KEY,
       model,
       reasoningEffort: this.env.REVIEW_REASONING_EFFORT ?? "max",
@@ -979,12 +984,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       signal,
       budget,
       ...providerRoute,
-      maxOutputTokensPerRequest: Math.round(boundedNumber(
-        this.env.REVIEW_MODEL_MAX_OUTPUT_TOKENS,
-        DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
-        2_000,
-        384_000,
-      )),
+      maxOutputTokensPerRequest,
       requireInitialToolCall: booleanSetting(this.env.REVIEW_REQUIRE_INITIAL_TOOL_CALL, false),
       maxExplorationTurns: Math.round(boundedNumber(
         this.env.REVIEW_MAX_EXPLORATION_TURNS,
@@ -992,6 +992,22 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         1,
         2,
       )),
+    };
+    const agent = new ReviewAgent(agentOptions);
+    const verificationAgent = new ReviewAgent({
+      ...agentOptions,
+      maxOutputTokensPerRequest: Math.min(
+        maxOutputTokensPerRequest,
+        DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST,
+      ),
+    });
+    const verificationRescueAgent = new ReviewAgent({
+      ...agentOptions,
+      maxOutputTokensPerRequest: Math.min(
+        maxOutputTokensPerRequest,
+        DEFAULT_VERIFICATION_MAX_OUTPUT_TOKENS_PER_REQUEST,
+      ),
+      maxExplorationTurns: 2,
     });
     const discoveryTools = new RepositoryTools(repository);
     const directDiscovery = shouldUseDirectDiscovery(
@@ -1078,42 +1094,24 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     if (!(await this.#markSessionPhase(lease, "verification", checkRunId))) {
       throw new Error("review superseded before verification");
     }
-    const verificationCandidates = tagVerificationCandidates(candidates.map(({ review }) => review));
-    // Verification gets a phase-local evidence ledger. It may reuse immutable
-    // repository caches, but it cannot turn a discovery-only read into an
-    // independently confirmed or refuted verdict by guessing that scope.
-    const verificationTools = withOpaqueEvidenceHandles(new RepositoryTools(repository));
-    const verificationAnchorEvidence = await prefetchVerificationAnchors(
-      verificationCandidates,
-      verificationTools,
-      signal,
-    );
-    const verificationOutput = await agent.runVerification(
-      verificationPrompt(job, candidates.map((candidate, index) => ({
-        ...candidate,
-        review: verificationCandidates[index]!,
-      })), changes, policy, verificationAnchorEvidence),
-      verificationTools,
-    );
-    const verificationCoverage = verificationTools.coverage();
-    const verificationResolution = resolveVerificationVerdicts(
-      verificationOutput,
-      verificationCandidates,
-      verificationCoverage,
-    );
     const maxFindings = Math.round(boundedNumber(this.env.REVIEW_MAX_FINDINGS, 8, 1, 20));
-    // Reconcile terminal filtering back into the verification ledger. A model
-    // confirmation withheld by confidence, deduplication, anchor validation,
-    // or the finding limit is review uncertainty, never a green clean result.
     const {
       coverage,
       minConfidence,
       review,
       resolution: publicationResolution,
-    } = finalizeVerificationPublication(verificationResolution, {
+      rescue,
+    } = await verifyAndPublish({
+      runner: verificationAgent,
+      rescueRunner: verificationRescueAgent,
+      tools: new RepositoryTools(repository),
+      job,
+      discoveries: candidates,
+      changes,
+      policy,
+      signal,
       changedLines,
       discoveryCoverage: discovery.coverage,
-      verificationCoverage,
       configuredBaseThreshold: this.env.REVIEW_MIN_CONFIDENCE,
       configuredIncompleteEvidenceFloor: this.env.REVIEW_INCOMPLETE_EVIDENCE_MIN_CONFIDENCE,
       maxFindings,
@@ -1129,6 +1127,14 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       verificationInsufficient: publicationResolution.insufficientCandidateIds.length,
       verificationInvalidEntries: publicationResolution.invalidVerdictCount,
       verificationConfirmedWithheld: publicationResolution.withheldConfirmedCandidateCount,
+      verificationRescueCandidate: rescue?.attemptedCandidateId,
+      verificationRescueSucceeded: rescue?.succeeded,
+      verificationRescueError: rescue?.error,
+      verificationCandidateFates: JSON.stringify(publicationResolution.candidateFates.map((fate) => ({
+        candidateId: fate.candidateId,
+        verification: fate.verification.reason,
+        publication: fate.publication.reason,
+      }))),
     });
     return { review, inlineFindings: review.findings, coverage };
   }

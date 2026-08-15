@@ -153,6 +153,25 @@ describe("GitHubClient review state", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
+  it("opens a history-free repository archive at the exact requested commit", async () => {
+    const bytes = new Uint8Array([31, 139, 8, 0]);
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe(`https://api.github.com/repos/owner/repo/tarball/${job().headSha}`);
+      expect(init?.redirect).toBe("follow");
+      return new Response(bytes, {
+        status: 200,
+        headers: { "content-length": String(bytes.byteLength) },
+      });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const archive = await testClient().getRepositoryArchive(job(), job().headSha);
+
+    expect(archive.contentLength).toBe(bytes.byteLength);
+    await expect(new Response(archive.body).arrayBuffer()).resolves.toHaveProperty("byteLength", bytes.byteLength);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
   it("paginates the cumulative file set beyond the previous 300-file cap", async () => {
     const fetch = vi.fn(async (input: string | URL | Request) => {
       const page = Number(new URL(String(input)).searchParams.get("page"));

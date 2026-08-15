@@ -76,7 +76,7 @@ describe("verification anchor evidence", () => {
     }
   });
 
-  it("issues opaque handles and lets a complete narrow read supersede a broad truncated read", async () => {
+  it("keeps incomplete observations non-citable and issues a new proof handle for recovery", async () => {
     let calls = 0;
     const broadScope = "read_file:head:pydantic_ai_harness/compaction/_shared.py:1-400";
     const narrowScope = "read_file:head:pydantic_ai_harness/compaction/_shared.py:80-120";
@@ -129,15 +129,33 @@ describe("verification anchor evidence", () => {
       end_line: 120,
     }));
 
-    expect(broad.evidence?.scope).toBe("GASTON-EVIDENCE-1");
-    expect(narrow.evidence?.scope).toBe("GASTON-EVIDENCE-2");
+    expect(broad.evidence?.scope).toBe("GASTON-OBSERVATION-1");
+    expect(narrow.evidence?.scope).toBe("GASTON-EVIDENCE-1");
     expect(JSON.stringify([broad.evidence, narrow.evidence])).not.toContain("pydantic_ai_harness");
     expect(tools.coverage?.()).toMatchObject({
-      sufficient: true,
-      limitations: [],
-      unresolvedEvidence: [],
-      completedEvidenceScopes: ["GASTON-EVIDENCE-1", "GASTON-EVIDENCE-2"],
+      sufficient: false,
+      limitations: ["read_file: Read a narrower range."],
+      unresolvedEvidence: [{
+        scope: "GASTON-OBSERVATION-1",
+        status: "truncated",
+      }],
+      completedEvidenceScopes: ["GASTON-EVIDENCE-1"],
     });
+    expect(tools.dossier(["GASTON-EVIDENCE-1"])).toEqual([{
+      handle: "GASTON-EVIDENCE-1",
+      tool: "read_file",
+      arguments: {
+        path: "pydantic_ai_harness/compaction/_shared.py",
+        ref: "head",
+        start_line: 80,
+        end_line: 120,
+      },
+      content: "complete narrow read",
+    }]);
+    expect(tools.dossier(["GASTON-OBSERVATION-1"])).toEqual([]);
+    expect(new TextEncoder().encode(JSON.stringify(tools.dossier([
+      "GASTON-EVIDENCE-1",
+    ], 120))).byteLength).toBeLessThanOrEqual(120);
   });
 });
 

@@ -19,6 +19,8 @@ export interface RecentPrBenchCase {
   title: string;
   baseSha: string;
   headSha: string;
+  /** Exact number of commits in the frozen base...head comparison. */
+  expectedCommitCount?: number;
   bots: string[];
   labels: RecentPrBenchLabel[];
 }

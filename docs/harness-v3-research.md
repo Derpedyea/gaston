@@ -902,6 +902,107 @@ found 5/5 canonical bugs, but both final arms published 2/5. Specific failures:
    the false-comment rate. Public bot-derived labels also select for bugs those
    bots already recognize and can be contaminated by public review text.
 
+#### Controlled cross-model verifier rerun (2026-08-13)
+
+After the verifier/publication fixes, a paired verifier-only rerun reused the
+exact same 11 Luna discovery candidates across the four immutable heads and
+five labels. This removes stochastic rediscovery from the model comparison.
+Both arms used the same evidence tools, candidate-local rescue, publication
+policy, request/token ceilings, and `$0.25` per-case safety cap. The harness
+fingerprint was
+`031d0c312cff4977bac3781a12e00d0474b98970954b05e6d7fd53ba2e54baeb`;
+the seed-discovery digest was
+`0f20d3575da0e8464ba33429a77b0e8c2de0b3cafd91c4c78d1d316eb504ced5`.
+
+| Verifier | Labeled recall | Published / candidates | Strict precision lower bound | Insufficient | Requests | Tool calls | Total cost | Median case latency |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Luna Max / OpenAI | 5/5 (100%) | 8/11 | 62.5% | 3 | 11 | 33 | $0.038129 | 60.0 s |
+| DeepSeek V4 Pro XHigh / DeepSeek | 4/5 (80%) | 6/11 | 66.7% | 5 | 12 | 33 | $0.091043 | 131.2 s |
+
+The cross-model critic removed one unmatched finding pending adjudication, but
+also withheld the known Pydantic post-anchor-instruction defect. It additionally
+withheld the unmatched T3 draft/attachment candidate. The cache-accounting
+candidate remained insufficient after focused rescue in both arms. Treating
+pending unmatched findings as false positives only for a conservative lower
+bound, Luna's F1/F2 were 76.9%/89.3% versus DeepSeek's 72.7%/76.9%.
+
+DeepSeek cost 2.39 times as much overall, had 2.19 times the median latency, and
+cost 2.98 times as much per labeled true positive. This small public corpus is
+not a general model ranking and still lacks clean controls, but it rejects the
+proposed DeepSeek cross-model veto for this harness: it traded away known recall
+without a sufficient precision, cost, or latency gain. The same-model Luna
+verifier remains the default. Private artifact digests are
+`3b9eb3360707b066368526bbc8363bbdd43cd6138abc1d5500eb56778deed323`
+(Luna) and
+`956e57d9929495410ac0caa5623345f08b19c3bf1eece06eb47191364335c204`
+(DeepSeek).
+
+#### Luna verifier harness micro-A/Bs (2026-08-13)
+
+The remaining Luna changes were evaluated one at a time against saved discovery
+candidates or a one-case discovery arm. These are consumed public regression
+cases, not fresh holdout evidence. The Pydantic arms all preserved both known
+labels; candidate terminality counts confirmed, evidence-backed refuted, and
+insufficient outcomes across the same four candidates.
+
+| Pydantic verifier arm | Known labels | Terminal candidates | Requests | Tool calls | Cost | Wall time | Decision |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Previous rescue harness | 2/2 | 2/4 | 5 | 14 | $0.018308 | 155.0 s | Baseline |
+| Typed gaps + routeable rescue | 2/2 | 2/4 | 3 | 9 | $0.013737 | 119.0 s | Enabled |
+| Verified pinned-dependency source | 2/2 | 3/4 | 5 | 13 | $0.019870 | 182.2 s | Enabled for dependency gaps |
+| Path-local clusters of at most 3 | 2/2 | 3/4 | 7 | 18 | $0.022040 | 108.7 s | Opt-in only |
+
+Typed gaps removed a failed dependency rescue: cost fell 25%, wall time 23%,
+requests 40%, and tool calls 36% without changing known-label recall. Each
+insufficient verdict must now name one falsifiable missing fact and classify it
+as repository reachability, repository symbol, dependency contract, runtime
+semantics, tool failure, or unknown. Rescue is restricted to a gap with a
+matching harness capability and receives the completed evidence handles and
+contents cited on the first pass.
+
+The dependency arm resolved the cached-token claim correctly rather than merely
+making it publishable. Luna used the SHA-256-verified `pydantic-ai-slim==2.27.0`
+source contract, which states that normalized `input_tokens` already includes
+cache reads/writes, and refuted the claim at 0.99 confidence. The resolver reads
+the exact PR-head `uv.lock`, permits only `files.pythonhosted.org`, checks locked
+size and SHA-256, bounds compressed/unpacked data, parses the sdist without
+executing it, and returns immutable provenance. This follows uv's definition of
+`uv.lock` as the exact resolved project versions and PyPI's artifact-hash model.
+[uv project layout and lockfile](https://docs.astral.sh/uv/concepts/projects/layout/),
+[PyPI JSON API](https://docs.pypi.org/api/json/).
+
+Path-local clustering ran two verifier contexts concurrently and cut this long
+case's wall time 40%, but increased cost 11% and tool calls 38% while producing
+the same terminal outcomes. The capability and `--verification-cluster-size`
+benchmark switch remain available, but the full batch remains the default.
+
+Discovery now emits structured trigger, changed behavior, execution path,
+observable failure, falsifier, and single unresolved-fact fields. A direct A/B
+found the known bare-padding regression during discovery (1/1), but passing
+those untrusted subclaims into verification reduced publication to 0/1 because
+Luna treated a future regression-test trigger as a required current bad state.
+The accepted design stores the structure for harness auditing/routing while the
+verifier remains blind to it. Reusing that exact saved discovery with the blind
+boundary restored 1/1 publication in 26.2 seconds for $0.002687.
+
+Finally, `benchmarks/luna-verifier-calibration.json` adds one known positive and
+one minimally related negative control on the same frozen head. Luna confirmed
+and published the positive, refuted the false `py-`-inside-a-word claim, and
+published no unmatched finding in 52.4 seconds for $0.005030. The
+`eval:verifier-calibration` checker fails on either a dropped positive or a
+confirmed/published control. This is a regression/calibration gate, not an
+estimate of production false-positive prevalence.
+
+After the final proof/observation-handle hardening, a second live run under
+harness fingerprint
+`42fad8f81d6f2e1e7aade53bd93ade42bf1c287f2c33756fb0db4b3612337aa7`
+again published the positive and refuted the control. It used two model
+requests, cost $0.005917, and completed in 57.1 seconds. A deterministic replay
+of the earlier four-PR Luna verifier artifact also preserved all 8/8 prior
+publications. The repeat confirms decision compatibility across the trust-
+boundary hardening; the small cost and latency difference is one stochastic
+sample, not a performance regression claim.
+
 Two launch compatibility failures were fixed during the run. DeepSeek's two
 available endpoints rejected JSON Schema but accepted `json_object`, so
 structured-output mode is now explicit and still defaults to strict schema.
@@ -922,6 +1023,147 @@ vendor authored the set and judging process, only a subset of negatives
 received manual QA, and the published results were used to improve Macroscope.
 Martian's open benchmark is a better reproducible external regression reference
 but has its own post-review-fix attribution and public-contamination limits.
+
+## Blind 14-PR T3 Code head-to-head (2026-08-13)
+
+To measure the deployed workflow rather than another synthetic benchmark, 14
+new T3 Code PR heads were frozen after the earlier corpus cutoff. The private
+manifest pinned every head SHA and, where history could change, its expected
+commit count. Luna Max reviewed all heads once before any review comment body,
+label, later commit, or fix was read. The reveal then matched findings by root
+cause against top-level Macroscope and Cursor Bugbot comments whose
+`original_commit_id` was the frozen snapshot. Replies, withdrawn findings,
+documentation requests, and convention-only comments were excluded; the one
+bug reported by both bots was deduplicated.
+
+| Frozen PR | Macroscope bugs | Cursor bugs | Luna discovery overlap | Luna published overlap |
+| --- | ---: | ---: | ---: | ---: |
+| [#4786](https://github.com/pingdotgg/t3code/pull/4786) | 0 | 1 | 0 | 0 |
+| [#6540](https://github.com/pingdotgg/t3code/pull/6540) | 1 | 0 | 1 | 0 |
+| [#6541](https://github.com/pingdotgg/t3code/pull/6541) | 0 | 1 | 1 | 0 |
+| [#6542](https://github.com/pingdotgg/t3code/pull/6542) | 2 | 0 | 0 | 0 |
+| [#6547](https://github.com/pingdotgg/t3code/pull/6547) | 0 | 2 | 0 | 0 |
+| [#6550](https://github.com/pingdotgg/t3code/pull/6550) | 1 | 2 | 1 | 1 |
+| [#6551](https://github.com/pingdotgg/t3code/pull/6551) | 0 | 1 | 0 | 0 |
+| [#6553](https://github.com/pingdotgg/t3code/pull/6553) | 4 | 0 | 1 | 0 |
+| [#6554](https://github.com/pingdotgg/t3code/pull/6554) | 2 | 2 | 1 | 1 |
+| [#6555](https://github.com/pingdotgg/t3code/pull/6555) | 1 | 2 | 1 | 1 |
+| [#6558](https://github.com/pingdotgg/t3code/pull/6558) | 4 | 1 | 1 | 1 |
+| [#6562](https://github.com/pingdotgg/t3code/pull/6562) | 0 | 1 | 0 | 0 |
+| [#6563](https://github.com/pingdotgg/t3code/pull/6563) | 3 | 2 | 2 | 1 |
+| [#6564](https://github.com/pingdotgg/t3code/pull/6564) | 0 | 1 | 1 | 0 |
+| **Total** | **18** | **16** | **10 unique** | **5 unique** |
+
+Across all 14 heads, the Macroscope/Cursor union contained 33 unique concrete
+bugs. Macroscope supplied 18/33 and Cursor 16/33; their one shared remote-update
+bug accounts for the difference from 34. Luna discovered 10/33 (30.3%) and
+published 5/33 (15.2%). This union is a useful competitor-relative target, not
+independent ground truth: by construction it favors the bots whose comments
+define it and cannot credit Luna-only findings.
+
+The fairest direct slice is the five heads reviewed by all three systems:
+[#6550](https://github.com/pingdotgg/t3code/pull/6550),
+[#6554](https://github.com/pingdotgg/t3code/pull/6554),
+[#6555](https://github.com/pingdotgg/t3code/pull/6555),
+[#6558](https://github.com/pingdotgg/t3code/pull/6558), and
+[#6563](https://github.com/pingdotgg/t3code/pull/6563). Their 19-bug union was
+covered 11/19 (57.9%) by Macroscope, 9/19 (47.4%) by Cursor, 6/19 (31.6%) by
+Luna discovery, and 5/19 (26.3%) by Gaston's published output. Against
+Macroscope's own 18 findings across every Macroscope-reviewed frozen head, Luna
+discovered 6/18 (33.3%) and published 4/18 (22.2%). Gaston therefore trails
+Macroscope materially on recall in this real-PR sample.
+
+The run produced 32 discovery candidates and 10 published findings for
+$0.409584 total ($0.02926 per PR) with 309.6-second median latency. All 14 cases
+completed on the pinned OpenAI Luna route with strict JSON Schema and no
+provider fallback. Five competitor bugs were found in discovery and then lost
+at verification: non-web link handling, numeric preview zoom, the skill-viewer
+symlink race, Windows multiline prompt spawning, and collapsed-anchor release.
+This makes verifier recall, not just discovery, the clearest bottleneck.
+
+Post-reveal adjudication found five published exact competitor matches. Two
+more Luna-only publications were independently corroborated by the subsequent
+PR fix sequence: preview-open fallback on #6540 and cross-turn model attribution
+on #6551. Two low-frequency security/liveness claims remain plausible but
+unconfirmed. One publication was disproved: #6558 already enriched stored image
+attachments with `previewUrl` in `ChatView`, a falsifier the verifier named but
+did not inspect. Thus 7/10 publications are confirmed, two remain unresolved,
+and one is a known false positive. The follow-up below makes concrete candidate
+falsifiers mandatory retrieval targets and tests smaller verifier clusters;
+simply lowering the publication threshold would recover known bugs but worsen
+the observed false-positive escape.
+
+## Seeded verifier rebench after evidence routing (2026-08-14)
+
+The 32 blind Luna discovery candidates above were frozen and replayed through
+the production verification path, so this experiment changes verification and
+publication only. The accepted arm keeps a full-batch blind first pass, exposes
+only candidate identity/anchor/falsification target initially, then gives at
+most two non-low routeable candidates an independent focused rescue. The
+harness prefetches the exact missing repository symbol or dependency contract;
+only in rescue does it disclose discovery's causal trace, explicitly as an
+untrusted routing hypothesis. Python `uv.lock` and pnpm/npm lock entries now
+share a generic dependency resolver with registry allowlisting, exact integrity
+verification, bounded extraction, and pnpm patch-hash verification.
+
+| Result | Original end-to-end run | Seeded verifier rebench |
+| --- | ---: | ---: |
+| Frozen PRs / failures | 14 / 0 | 14 / 0 |
+| Fixed discovery candidates | 32 | 32 |
+| Published findings | 10 | 5 |
+| Macroscope/Cursor-union matches | 5/33 (15.2%) | 4/33 (12.1%) |
+| Macroscope-only matches | 4/18 (22.2%) | 4/18 (22.2%) |
+| All-three direct-slice matches | 5/19 (26.3%) | 4/19 (21.1%) |
+| Known #6558 hydration false positive | published | refuted |
+| Cost | $0.409584 end to end | $0.240794 verifier only |
+| Median latency | 309.6 s end to end | 104.8 s verifier only |
+
+The accepted artifact is
+`.private/evals/recent-bot-prs/t3code-fresh-luna-verifier-proof-standard-final-2026-08-14.json`.
+All 14 cases completed on OpenAI Luna with strict JSON Schema, no provider
+fallback, and identical start/end harness fingerprints. Cost and latency are
+not directly comparable with the original because discovery was replayed
+rather than rerun.
+
+The precision result improved more clearly than recall. Four publications are
+exact competitor matches (#6554 pre-install outcome, #6555 duplicate paste,
+#6558 arbitrary local image read, and #6563 signal termination). The fifth,
+unnegotiated update telemetry on #6554, remains a Luna-only finding pending
+independent adjudication. The previously known false publication is now
+explicitly refuted from the unchanged `ChatView` attachment-enrichment path.
+On the user's primary Macroscope comparison, published recall therefore remains
+4/18 rather than improving; the union loses the Cursor-side #6550 overlap.
+
+Targeted controls showed the new routes can recover #6564's collapsed-anchor
+failure and can both confirm #6558's real file-read bug and refute its hydration
+false positive. Full-corpus variance still suppressed #6553 and #6564, so those
+targeted confirmations are not counted in the table. Two tempting arms were
+rejected: default two-candidate clustering exhausted the request budget and
+published only two findings, while retrying an inconclusive rescue reopened the
+known #6558 false positive and exhausted the resource budget on #6564. The
+shipped path does neither. The honest conclusion is higher publication safety
+with unchanged Macroscope-relative recall, not a recall win.
+
+### Batched evidence routing follow-up (2026-08-14)
+
+A seven-case seeded gate then replaced per-candidate cold rescues with one
+batched evidence-completion pass and added an explicit production-topology
+obligation for version-skew claims. The first arm published the same three
+known-good findings in this slice, recovered none of the suppressed targets,
+and withheld the independently refuted #6554 mixed-version claim. It cost
+`$0.154792` across seven cases, so batching alone was not accepted as a recall
+claim.
+
+Verdict diagnostics exposed a deterministic routing defect: the prefetcher
+searched only the first identifier in the missing-evidence statement and
+discarded matches in the candidate's own file. The corrected router searches
+up to three named symbols locally and repository-wide and reads same-file
+callers away from the anchor. On #6540, the pre-fix route left the competitor
+non-web-link bug insufficient; the corrected route confirmed and published it
+while withholding the alternate unresolved candidate. The targeted artifact is
+`.private/evals/recent-bot-prs/t3code-6540-candidate-context-route-2026-08-14.json`
+(`$0.024856`). This is one recovered competitor bug, not yet a full-corpus
+ranking claim.
 
 ## Research findings that changed the harness
 
@@ -973,6 +1215,35 @@ silently replace a discovery with an unrelated bug at the same line.
 [Agentic Code Reasoning](https://arxiv.org/abs/2603.01896),
 [Refute-or-Promote](https://arxiv.org/abs/2604.19049),
 [AACR-Bench](https://arxiv.org/abs/2601.19494)
+
+### Independent angles help recall, but clean context is the cheaper boundary
+
+Current practitioner systems converge on independent read-only review angles
+followed by one synthesis boundary. Anthropic's public Code Review Plugin runs
+four parallel reviewers (two policy, one bug finder, and one history-aware
+reviewer) and filters the merged candidates at an 80-confidence threshold. A
+current Claude review prompt expands that pattern to eight finder angles and a
+separate tri-state verification phase. Cloudflare reports a still wider system
+with up to seven specialists and a top-tier coordinator that deduplicates and
+rechecks uncertain findings. The design is credible at production scale, but
+Cloudflare's published median cost is $0.98 per review, well beyond Gaston's
+$0.20 ceiling.
+
+The lower-cost lesson is context isolation rather than unconditional fan-out.
+Cognition reports that a review agent works best without the coding agent's
+prior trajectory: the clean context avoids inheriting its assumptions and
+reduces context rot. This is also the useful part of the Tech Twitter discussion
+for Gaston. Discovery and verification therefore remain separate cold model
+contexts; the verifier receives harness-owned candidate identities and exact
+anchors, not discovery rationale, confidence, proposed fixes, or proof
+obligations. Extra finder clusters remain an evaluation knob until they improve
+recall without recreating the false-positive and cost regressions measured for
+universal extra turns.
+
+[Anthropic Code Review Plugin](https://github.com/anthropics/claude-plugins-official/blob/4a3e6565eae08b14c5efcb842d87dee8ae99527f/plugins/code-review/README.md),
+[Claude medium-effort review prompt](https://github.com/piebald-ai/claude-code-system-prompts/blob/3fdaff67366bdb2713c00e4a3020970abf3441d6/system-prompts/agent-prompt-code-review-part-6-medium-effort-mode.md),
+[Cloudflare AI code review](https://blog.cloudflare.com/ai-code-review/),
+[Cognition clean-context review loop](https://x.com/walden_yan/status/2047054401341370639)
 
 ### More turns are not a free recall improvement
 
@@ -1061,9 +1332,9 @@ even when the model slug stays fixed.
   Repository results expose opaque harness-issued evidence handles instead of
   path-shaped identities the model must retype. Confirmations and refutations
   require nonempty handles that the verifier's phase-local harness ledger—not
-  the model—records as complete. A successful narrow file read supersedes an
-  earlier broad truncated read of the same ref/path without erasing the audit
-  trail.
+  the model—records as complete. Partial or failed retrievals receive separate,
+  non-citable observation identities; a successful recovery receives a new
+  proof handle and never promotes content that was not returned.
   Discovery-only reads cannot satisfy the independent-verification boundary,
   and unresolved candidates force a neutral terminal check. Publication keeps discovery's
   already validated exact changed-line anchor. Findings are never moved from
@@ -1072,6 +1343,21 @@ even when the model slug stays fixed.
   candidate-bound confirmation. An unrelated unresolved candidate remains
   withheld and keeps aggregate coverage incomplete, but no longer raises the
   floor for confirmed candidates.
+- An insufficient verdict names one typed, falsifiable evidence gap. Routeable
+  non-low candidates share one batched cold evidence-completion pass; terminal
+  verdicts are never polled. Each candidate receives a bounded dossier of
+  completed first-pass evidence, harness-prefetched routes to up to three named
+  symbols (scoped and repository-wide, including its own file), and discovery's
+  causal trace only as an untrusted hypothesis. Version-skew and multi-process
+  claims must prove that the alleged peers can coexist in production.
+  Dependency-contract gaps can search hash-verified `uv.lock` Python sdists or
+  pnpm/npm-pinned JavaScript tarballs without executing them, including
+  verification of pnpm patch hashes.
+  Candidate verification and publication
+  outcomes retain explicit reason codes, while production and temporal
+  evaluation use the same deep verification pipeline. A pure deterministic
+  replay entry point permits saved verifier transcripts to be re-evaluated
+  after trust-policy changes without another model request.
 - Temporal evaluation currently imports the same pure changed-file and patch
   renderers as production. A tracked renderer/workspace parity regression and
   a fingerprinted runner make drift visible, but the ignored runner itself is
@@ -1123,8 +1409,9 @@ even when the model slug stays fixed.
    diff size, defect class, bot, and validated negative claim.
 3. Test adaptive second turns only on auth, concurrency, migrations, data loss,
    public API compatibility, and unresolved high-severity causal paths.
-4. Compare same-model verification with a small cold cross-model veto at equal
-   cost, including clean controls and minority-veto calibration.
+4. Revisit cross-model verification only with clean controls and
+   minority-veto calibration; the controlled public-corpus DeepSeek arm lost
+   one of five known bugs while costing materially more than same-model Luna.
 5. Add safe executable reproducers for selected high-severity candidates in an
    isolated environment; never execute arbitrary PR code in the Worker.
 6. Measure author acceptance, later fix survival, duplicates, inspection time,
@@ -1196,6 +1483,10 @@ Provider and implementation references:
 54. [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
 55. [Macroscope code-review benchmark](https://macroscope.com/blog/code-review-benchmark)
 56. [OpenRouter DeepSeek V4 Pro 0813](https://openrouter.ai/deepseek/deepseek-v4-pro-0813)
+57. [Anthropic Code Review Plugin](https://github.com/anthropics/claude-plugins-official/blob/4a3e6565eae08b14c5efcb842d87dee8ae99527f/plugins/code-review/README.md)
+58. [Claude medium-effort review prompt](https://github.com/piebald-ai/claude-code-system-prompts/blob/3fdaff67366bdb2713c00e4a3020970abf3441d6/system-prompts/agent-prompt-code-review-part-6-medium-effort-mode.md)
+59. [Cloudflare AI code-review architecture and production results](https://blog.cloudflare.com/ai-code-review/)
+60. [Cognition clean-context multi-agent review loop](https://x.com/walden_yan/status/2047054401341370639)
 
 ## Rerun inputs
 

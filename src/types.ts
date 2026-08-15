@@ -52,6 +52,15 @@ export interface Finding {
   evidence: string;
   suggestedFix: string;
   confidence: number;
+  /** Discovery-authored, untrusted atomic claims for verifier falsification. */
+  proofObligations?: {
+    trigger: string;
+    changedBehavior: string;
+    executionPath: string;
+    observableFailure: string;
+    falsifier: string;
+    unresolvedFact: string;
+  };
 }
 
 export interface ReviewOutput {
@@ -60,6 +69,14 @@ export interface ReviewOutput {
 }
 
 export type VerificationVerdictKind = "confirmed" | "refuted" | "insufficient";
+
+export type VerificationEvidenceGapKind =
+  | "repository_reachability"
+  | "repository_symbol"
+  | "dependency_contract"
+  | "runtime_semantics"
+  | "tool_failure"
+  | "unknown";
 
 /**
  * A parsed verifier entry. `valid` is harness-owned: malformed model entries
@@ -77,6 +94,10 @@ export interface VerificationVerdict {
   evidence: string;
   evidenceComplete: boolean | null;
   evidenceScopes: string[];
+  /** Harness-routable classification for an inconclusive verdict. */
+  missingEvidenceKind: VerificationEvidenceGapKind | null;
+  /** One concrete, falsifiable fact whose retrieval would decide the claim. */
+  missingEvidence: string;
   valid: boolean;
 }
 

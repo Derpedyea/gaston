@@ -67,8 +67,14 @@ flowchart LR
 The Worker verifies GitHub's HMAC signature before accepting a job. A queue
 moves inference off the webhook request, while one Durable Object per pull
 request prevents duplicate reviews and supersedes stale in-flight work when a
-new head arrives. Computer caches the evidence the agent reads without cloning
-or executing the repository.
+new head arrives. For repositories inside strict file and byte limits, Gaston
+streams GitHub's history-free source archive for the exact head SHA into an
+immutable Computer snapshot. Extraction validates gzip/tar structure, rejects
+unsafe paths, and reconciles every archived path against GitHub's exact Git
+tree. Repositories using `export-ignore`/`export-subst`, truncated trees, or
+unsupported size limits retain the existing exact GitHub read fallback. A ready
+marker is committed only after the snapshot is complete. Nothing clones,
+checks out, or executes pull-request code.
 
 The discovery agent can list changed files, inspect bounded patch slices, list repository
 paths, read bounded file slices, and perform literal code searches. It receives
@@ -86,8 +92,26 @@ a file counts as fully inspected. A separate cold same-model verifier runs only
 when discovery produced candidates. Candidate IDs, exact anchors, and opaque
 `GASTON-EVIDENCE-N` handles are harness-owned, so the model never has to retype
 a path-shaped evidence identity. A conclusive verdict is accepted only when
-every cited handle is complete in the verifier's phase-local ledger; a complete
-narrow read may supersede its earlier broad truncated read of the same file.
+every cited handle is complete in the verifier's phase-local ledger. Partial or
+failed retrievals receive non-citable `GASTON-OBSERVATION-N` IDs; a successful
+recovery receives a new proof handle and can never promote unseen content.
+Routeable non-low candidates left insufficient share one batched cold
+evidence-completion pass. The blind first pass sees only candidate identities,
+anchors, and falsification targets. The batch receives bounded per-candidate
+dossiers, harness-prefetched repository/dependency evidence, and each original
+causal hypothesis as untrusted routing. Missing repository facts are searched
+by up to three named symbols both locally and repository-wide, including
+same-file callers away from the changed anchor. Compatibility claims must also
+prove that the alleged versions or processes can coexist in production.
+Dependency contracts can be read from exact `uv.lock`-pinned Python sdists or
+`pnpm-lock.yaml`/npm-pinned tarballs: Gaston restricts registry hosts, verifies
+the locked SHA-256 or SHA-512, verifies pnpm patch hashes, bounds decompression,
+parses source without execution, and exposes immutable package/version/hash
+provenance. Every candidate then has an auditable fate
+reason for verification and publication, and production plus evaluation share
+the same verification pipeline and deterministic transcript replay boundary.
+Saved benchmark artifacts can be re-evaluated without inference with
+`bun run eval:replay-verification <artifact.json>`.
 Discovery reads cannot masquerade as independent verification. Omitted,
 malformed, invented, or still-incomplete evidence fails closed as
 `insufficient`, never as a silent veto, and any unresolved candidate keeps the
@@ -100,8 +124,10 @@ continuation metadata; bounded prose/file results use marked head/tail previews.
 When the initial cumulative diff exceeds its 40 KB prompt allowance, Gaston
 stratifies that allowance across changed hunks instead of deleting the global
 middle, so a middle file or middle hunk cannot disappear from initial review.
-Immutable trees and files are cached by commit SHA
-across new PR heads, while per-run context is cleared independently.
+Immutable head snapshots, trees, and lazily fetched base files are cached by
+commit SHA across new PR heads, while per-run context is cleared independently.
+The model still sees only `repository_tree`, bounded `read_file`, and bounded
+literal `search_code`; the archive and filesystem are never exposed as a shell.
 A shared fourteen-minute/request/token/cost budget covers every phase, provider
 attempt, and queue redelivery. Resource usage is persisted before provider work
 leaves the Durable Object; queue backoff does not count as active review time.
@@ -171,7 +197,7 @@ permissions, installation, verification, and troubleshooting.
 | `REQUEST_CHANGES_ON` | `blocker` | `off`, `blocker`, or `high` |
 | `REVIEW_MAX_WALL_TIME_MS` | `840000` | Aggregate active-review wall-clock limit; queue backoff is excluded |
 | `REVIEW_MODEL_TIMEOUT_MS` | `660000` | Timeout for one provider attempt |
-| `REVIEW_MAX_MODEL_REQUESTS` | `9` | Aggregate provider-attempt limit |
+| `REVIEW_MAX_MODEL_REQUESTS` | `15` | Aggregate provider-attempt limit |
 | `REVIEW_MAX_INPUT_TOKENS` | `250000` | Approximate aggregate input-token limit |
 | `REVIEW_MAX_OUTPUT_TOKENS` | `128000` | Reported aggregate output-token limit |
 | `REVIEW_MAX_COST_USD` | `0.20` | Reported aggregate OpenRouter cost limit |
@@ -261,6 +287,11 @@ cost cap, and ignored output path to execute a paid arm. The DeepSeek Cloud
 route requires the explicit data-collection opt-in; provider pinning prevents
 fallback to GMICloud or another endpoint.
 
+Use `--corpus .private/path/to/blind-corpus.json` to evaluate an ignored fresh
+corpus before reading its public bot comments or fixes. Cases default to one
+commit; set `expectedCommitCount` when the exact reviewed base-to-head snapshot
+contains more than one commit.
+
 ```bash
 bun run eval:models --run \
   --model openai/gpt-5.6-luna --provider openai --effort max \
@@ -272,6 +303,25 @@ bun run eval:models --run \
   --structured-output json_object --allow-data-collection \
   --max-cost-usd 0.25 \
   --output .private/evals/recent-bot-prs/deepseek.json
+```
+
+To isolate verifier behavior, `--discovery-artifact <prior-run.json>` reuses
+the exact validated discovery candidates in that artifact and runs inference
+only for verification. Run same-model and cross-model arms from the same seed
+artifact to avoid confounding verifier results with stochastic rediscovery.
+
+`--verification-cluster-size N` enables the opt-in path-local clustering A/B;
+it is not the production default because the measured latency gain increased
+cost and tool calls. The tracked positive/negative Luna calibration can be run
+and checked with:
+
+```bash
+bun run eval:models --run --case t3code-bare-padding-regression \
+  --model openai/gpt-5.6-luna --provider openai --effort max \
+  --structured-output json_object --discovery-artifact benchmarks/luna-verifier-calibration.json \
+  --output .private/evals/recent-bot-prs/luna-calibration.json
+bun run eval:verifier-calibration benchmarks/luna-verifier-calibration.json \
+  .private/evals/recent-bot-prs/luna-calibration.json
 ```
 
 `bun run check:privacy` fails CI if a private eval directory or historical PR
