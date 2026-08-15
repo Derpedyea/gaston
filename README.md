@@ -24,7 +24,11 @@ through OpenRouter. The measured default pins Luna's OpenAI route and uses its
 [zero-data retention](https://openrouter.ai/docs/guides/features/zdr) is an
 explicit opt-in for repositories that need it.
 
-There are no containers, Docker images, shells, or dynamically executed PRs.
+There are no containers, Docker images, native shells, or dynamically executed
+PRs. When an exact head snapshot is available, agents may use a read-only
+simulated shell in an isolated Cloudflare Dynamic Worker for fast repository
+navigation; CI remains responsible for builds, tests, and deterministic
+validation.
 
 ## What makes it useful
 
@@ -46,8 +50,9 @@ There are no containers, Docker images, shells, or dynamically executed PRs.
   verdict for every changed-line candidate.
 - **Repository aware:** reads relevant files and searches code at the exact
   base or head commit instead of reasoning from an isolated diff.
-- **Safe by construction:** exposes bounded read-only tools; PR code is never
-  executed and the model never receives GitHub or OpenRouter credentials.
+- **Safe by construction:** exposes bounded exact-source tools plus a
+  discovery-only read-only terminal; PR code is never executed and the model
+  never receives GitHub or OpenRouter credentials.
 - **Frugal:** uses a serverless Worker, queues, per-PR Durable Objects, and an
   inexpensive model without paying for idle containers.
 
@@ -59,6 +64,7 @@ flowchart LR
   W --> Q[Review queue]
   Q --> DO[Per-PR Durable Object]
   DO <--> FS[Computer workspace]
+  DO -->|read-only repository navigation| DW[Dynamic Worker shell]
   DO -->|bounded reads| GH
   DO -->|bounded discovery + verifier| OR[OpenRouter / GPT-5.6 Luna]
   DO -->|changed-line findings| GH
@@ -76,10 +82,15 @@ unsupported size limits retain the existing exact GitHub read fallback. A ready
 marker is committed only after the snapshot is complete. Nothing clones,
 checks out, or executes pull-request code.
 
-The discovery agent can list changed files, inspect bounded patch slices, list repository
-paths, read bounded file slices, and perform literal code searches. It receives
-one evidence turn with at most four parallel reads, then a tool-disabled final
-turn. A truncated or invalid result, an exact-patch coverage shortfall, or an
+The discovery agent can list changed files, inspect bounded patch slices, list
+repository paths, read bounded file slices, perform literal code searches, and
+run short `rg`/`grep`/`find`/`sed`-style navigation commands against the
+read-only exact-head snapshot. Terminal output is always a non-citable
+observation; a finding or verifier verdict must retrieve its load-bearing lines
+again through an exact file or patch tool. Discovery receives one broad
+evidence turn with at most four parallel calls and one optional targeted
+follow-up with at most two calls, then a tool-disabled final turn. A truncated
+or invalid result, an exact-patch coverage shortfall, or an
 inventory-only first batch can unlock a targeted recovery batch with at most
 two calls. Only a new uncovered exact-patch continuation can unlock one final
 patch-only batch; the phase-wide ceiling is eight evidence calls. Inventory
@@ -126,8 +137,13 @@ stratifies that allowance across changed hunks instead of deleting the global
 middle, so a middle file or middle hunk cannot disappear from initial review.
 Immutable head snapshots, trees, and lazily fetched base files are cached by
 commit SHA across new PR heads, while per-run context is cleared independently.
-The model still sees only `repository_tree`, bounded `read_file`, and bounded
-literal `search_code`; the archive and filesystem are never exposed as a shell.
+The Dynamic Worker sees only a chroot-like `/workspace` projection of the
+immutable head snapshot. Its filesystem RPC rejects writes with `EROFS`, paths
+cannot escape `/workspace`, outbound networking is disabled by Computer, and
+Git/artifact commands are disabled. Gaston accepts only single-line pipelines
+of allowlisted read commands and rejects shell evaluation, control operators,
+redirections, and mutating `find` actions before dispatch. The terminal never
+sees run metadata, credentials, or the rest of Computer storage.
 A shared fourteen-minute/request/token/cost budget covers every phase, provider
 attempt, and queue redelivery. Resource usage is persisted before provider work
 leaves the Durable Object; queue backoff does not count as active review time.
@@ -188,9 +204,9 @@ permissions, installation, verification, and troubleshooting.
 | `REVIEW_REQUIRE_ZDR` | `false` | Set to `true` with `REVIEW_PROVIDER=azure` for Luna zero-data retention. The incompatible OpenAI+ZDR pair fails before inference. `data_collection: deny` is sent regardless |
 | `REVIEW_REASONING_EFFORT` | `max` | `high`, `xhigh`, or `max`; the fresh Luna effort comparison favored `max`, and lower tiers are rejected rather than silently downgrading reasoning |
 | `REVIEW_MODEL_MAX_OUTPUT_TOKENS` | `64000` | Per-attempt completion ceiling; normal requests start at 32,000 and a true length exhaustion can use this ceiling |
-| `REVIEW_DIRECT_DISCOVERY` | `true` | Use one structured, tool-free issue-list pass when the complete changed code already fits the prompt; automatically retain bounded repository retrieval when evidence is incomplete |
+| `REVIEW_DIRECT_DISCOVERY` | `false` | Keep repository navigation available on every PR. Set to `true` only for a controlled shallow-path comparison that uses one tool-free issue-list pass when the complete changed code fits the prompt |
 | `REVIEW_REQUIRE_INITIAL_TOOL_CALL` | `false` | Require at least one repository evidence call before accepting a model verdict |
-| `REVIEW_MAX_EXPLORATION_TURNS` | `1` | One broad evidence turn, or `2` for one additional candidate-targeted confirmation turn |
+| `REVIEW_MAX_EXPLORATION_TURNS` | `2` | One broad navigation/evidence turn plus one candidate-targeted exact-evidence follow-up |
 | `REVIEW_MIN_CONFIDENCE` | `0.80` | Minimum confidence for each independently verified, candidate-bound finding; unrelated incomplete candidates do not raise it |
 | `REVIEW_INCOMPLETE_EVIDENCE_MIN_CONFIDENCE` | `0.88` | Aggregate incomplete-evidence fallback retained for non-candidate policy checks; an unresolved verifier candidate is withheld instead of raising other candidates' thresholds |
 | `REVIEW_MAX_FINDINGS` | `8` | Maximum inline findings per review |
@@ -238,11 +254,12 @@ you need a stricter spending boundary.
 
 ## Why no container?
 
-A CLI coding agent normally needs a Linux process, shell, and repository clone.
-Gaston implements the useful tool loop directly in the Worker and runs Computer
-in filesystem-only mode. A container would add startup time, image maintenance,
-attack surface, and idle-cost concerns without adding a capability this design
-needs.
+A CLI coding agent normally needs a Linux process, native shell, and repository
+clone. Gaston needs the navigation ergonomics, not native execution: Computer's
+Worker-shell backend runs a simulated shell on demand in a Dynamic Worker over
+the existing exact snapshot. A container would add startup time, image
+maintenance, attack surface, and idle-cost concerns; builds, tests, and other
+deterministic validation stay in CI.
 
 ## Development
 
@@ -343,8 +360,9 @@ directional configuration A/B are in
 - GitHub omits patches for binaries and some oversized changes; Gaston reports
   neutral, incomplete coverage instead of inventing findings or asserting the
   change is clean.
-- Cloudflare Computer is preview software. Version `0.1.1` is pinned and should
-  be reviewed before upgrades or use as a required merge gate.
+- Cloudflare Computer and its Worker-shell integration are preview software.
+  Version `0.1.1` is pinned and should be reviewed before upgrades or use as a
+  required merge gate.
 - AI review complements human review, tests, CodeQL, dependency scanning, and
   deterministic static analysis; it does not replace them.
 

@@ -1,4 +1,5 @@
 import { Reviewer, WorkspaceProxy } from "./reviewer.ts";
+import { WorkspaceServiceProxy } from "./repository-terminal.ts";
 import { getGitHubAppReadiness, GitHubClient } from "./github.ts";
 import { errorMessage, logError, logInfo } from "./log.ts";
 import { manualReviewJob } from "./review-job.ts";
@@ -7,7 +8,7 @@ import { handleReviewSessionApi } from "./session-api.ts";
 import type { Env, ManualReviewRequest, ReviewJob, ReviewOutcome, ReviewQueueMessage } from "./types.ts";
 import { handleGitHubWebhook } from "./webhook.ts";
 
-export { Reviewer, WorkspaceProxy };
+export { Reviewer, WorkspaceProxy, WorkspaceServiceProxy };
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {

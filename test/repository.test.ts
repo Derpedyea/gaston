@@ -113,6 +113,63 @@ describe("RepositoryWorkspace policy", () => {
 });
 
 describe("RepositoryTools", () => {
+  it("returns terminal navigation as advisory non-citable evidence", async () => {
+    const tools = new RepositoryTools({
+      changes: { files: [], diff: "", truncated: false },
+      terminal: vi.fn(async () => ({
+        command: "rg -n validator src",
+        exitCode: 0,
+        stdout: "src/check.ts:10:validate()\n",
+        stderr: "",
+      })),
+    } as unknown as RepositoryWorkspace);
+
+    await expect(tools.invoke("repository_terminal", '{"command":"rg -n validator src"}'))
+      .resolves.toMatchObject({
+        status: "ok",
+        evidence: { complete: false, advisory: true },
+        suggestedAction: expect.stringContaining("read_file"),
+      });
+    expect(tools.coverage()).toMatchObject({
+      sufficient: true,
+      toolCalls: 1,
+      okResults: 1,
+      completedEvidenceScopes: [],
+    });
+  });
+
+  it("does not let a failed optional terminal poison exact evidence coverage", async () => {
+    const tools = new RepositoryTools({
+      changes: { files: [], diff: "", truncated: false },
+      terminal: vi.fn(async () => {
+        throw new Error("dynamic worker unavailable");
+      }),
+    } as unknown as RepositoryWorkspace);
+
+    await expect(tools.invoke("repository_terminal", '{"command":"rg validator"}'))
+      .resolves.toMatchObject({
+        status: "permanent_error",
+        evidence: { complete: false, advisory: true },
+      });
+    expect(tools.coverage()).toMatchObject({ sufficient: true, permanentErrors: 1 });
+  });
+
+  it("rejects project execution commands before reaching the Dynamic Worker", async () => {
+    const terminal = vi.fn();
+    const tools = new RepositoryTools({
+      changes: { files: [], diff: "", truncated: false },
+      terminal,
+    } as unknown as RepositoryWorkspace);
+
+    await expect(tools.invoke("repository_terminal", '{"command":"npm test"}'))
+      .resolves.toMatchObject({
+        status: "invalid_arguments",
+        errorCode: "invalid_tool_arguments",
+        evidence: { complete: false, advisory: true },
+      });
+    expect(terminal).not.toHaveBeenCalled();
+  });
+
   it("marks the actual annotated prompt diff truncated when coordinate prefixes cross the byte cap", () => {
     const diff = `@@ -0,0 +1,3500 @@\n${Array.from({ length: 3_500 }, () => "+x").join("\n")}`;
     expect(new TextEncoder().encode(diff).byteLength).toBeLessThan(40_000);

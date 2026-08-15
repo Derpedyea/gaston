@@ -7,6 +7,11 @@ import {
   RepositorySnapshot,
   type RepositorySnapshotReport,
 } from "./repository-snapshot.ts";
+import {
+  REPOSITORY_TERMINAL_CWD,
+  REPOSITORY_TERMINAL_ROOT_POINTER,
+} from "./repository-terminal-filesystem.ts";
+import { validateRepositoryTerminalCommand } from "./repository-terminal-policy.ts";
 import type {
   PullChangeSet,
   RepositoryEntry,
@@ -22,6 +27,7 @@ const REF_CACHE_ROOT = `${ROOT}/cache/refs`;
 const MAX_FILE_BYTES = 400_000;
 const MAX_DEPENDENCY_LOCK_BYTES = 2_000_000;
 const MAX_TOOL_RESULT_BYTES = 12_000;
+const REPOSITORY_TERMINAL_TIMEOUT_MS = 8_000;
 export const INITIAL_DIFF_EXCERPT_BYTES = 40_000;
 const DEFAULT_PATCH_LINES = 200;
 const MAX_EXPLICIT_PATCH_LINES = 400;
@@ -44,6 +50,13 @@ export interface RepositoryCacheSnapshot {
 export interface RepositoryWorkspaceOptions {
   /** Materialize the exact PR-head archive into the immutable Computer cache. */
   snapshot?: boolean;
+}
+
+export interface RepositoryTerminalResult {
+  command: string;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
 }
 
 export class RepositoryWorkspace {
@@ -115,6 +128,12 @@ export class RepositoryWorkspace {
           status: "unavailable",
           reason: error instanceof Error ? error.message : String(error),
         };
+      }
+      if (this.#snapshotReport.status === "ready" || this.#snapshotReport.status === "reused") {
+        await this.#workspace.fs.writeFile(
+          REPOSITORY_TERMINAL_ROOT_POINTER,
+          this.#snapshot.filesRoot(),
+        );
       }
     }
   }
@@ -233,6 +252,37 @@ export class RepositoryWorkspace {
       ),
       ...(signal === undefined ? {} : { signal }),
     });
+  }
+
+  async terminal(command: string, signal?: AbortSignal): Promise<RepositoryTerminalResult> {
+    throwIfAborted(signal);
+    if (this.#snapshotReport.status !== "ready" && this.#snapshotReport.status !== "reused") {
+      throw new Error("the exact-head repository snapshot is unavailable; use repository_tree, search_code, or read_file");
+    }
+    const normalized = terminalCommandArgument(command);
+
+    const execution = await this.#workspace.runtime.exec(normalized, {
+      cwd: REPOSITORY_TERMINAL_CWD,
+      encoding: "utf8",
+      timeoutMs: REPOSITORY_TERMINAL_TIMEOUT_MS,
+    });
+    const abort = () => {
+      void execution.kill("SIGKILL").catch(() => undefined);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    try {
+      const result = await execution.result();
+      throwIfAborted(signal);
+      return {
+        command: normalized,
+        exitCode: result.exitCode,
+        stdout: result.stdout,
+        stderr: result.stderr,
+      };
+    } finally {
+      signal?.removeEventListener("abort", abort);
+      execution[Symbol.dispose]();
+    }
   }
 
   async optionalBaseFile(path: string, signal?: AbortSignal): Promise<string> {
@@ -876,6 +926,7 @@ export class RepositoryTools {
       args = parseArguments(rawArguments);
       validateToolArguments(name, args);
       let content: string;
+      let terminalExitCode: number | undefined;
       switch (name) {
         case "changed_files":
           content = this.#repo.changedFiles(
@@ -929,10 +980,40 @@ export class RepositoryTools {
             signal,
           );
           break;
+        case "repository_terminal": {
+          const terminal = await this.#repo.terminal(
+            terminalCommandArgument(args.command),
+            signal,
+          );
+          terminalExitCode = terminal.exitCode;
+          content = renderRepositoryTerminalResult(terminal);
+          break;
+        }
         default:
           throw new Error(`unknown tool: ${name}`);
       }
       throwIfAborted(signal);
+      if (name === "repository_terminal") {
+        const bounded = truncateToolResult(content, MAX_TOOL_RESULT_BYTES);
+        const result: EvidenceResult = {
+          // The evidence transport succeeded even when the simulated command
+          // returned a normal non-zero shell status (for example rg found no
+          // matches). The exit code remains explicit in the observation.
+          status: "ok",
+          content: bounded.content,
+          retryable: false,
+          evidence: {
+            scope: `repository_terminal:${hashValue(requiredString(args.command, "command"))}`,
+            complete: false,
+            advisory: true,
+          },
+          suggestedAction: terminalExitCode === 0
+            ? "Terminal output is discovery-only. Confirm any load-bearing code with read_file or an exact changed-patch tool."
+            : `The read-only command exited ${terminalExitCode ?? "without a status"}; inspect stderr, adjust it once if useful, and confirm any load-bearing code with an exact source tool.`,
+        };
+        this.#coverage.record(name, result);
+        return result;
+      }
       const evidenceTool = canonicalEvidenceTool(name);
       const evidenceArgs = canonicalEvidenceArguments(name, args) ?? {};
       const inferred = inferEvidence(evidenceTool, evidenceArgs, content);
@@ -978,6 +1059,7 @@ export class RepositoryTools {
         evidence: {
           scope: evidenceScope(evidenceTool, evidenceArgs),
           complete: false,
+          ...(name === "repository_terminal" ? { advisory: true } : {}),
           ...evidenceIdentity(evidenceTool, evidenceArgs),
         },
         suggestedAction: invalid
@@ -1022,6 +1104,28 @@ function truncateToolResult(content: string, maxBytes: number): { content: strin
   const decoder = new TextDecoder();
   const tail = tailBytes === 0 ? "" : decoder.decode(encoded.slice(-tailBytes));
   return { content: `${decoder.decode(encoded.slice(0, headBytes))}${marker}${tail}`, truncated: true };
+}
+
+function renderRepositoryTerminalResult(result: RepositoryTerminalResult): string {
+  return [
+    "Gaston repository terminal (discovery-only; not citable verifier evidence)",
+    `command: ${result.command}`,
+    `exitCode: ${result.exitCode}`,
+    "stdout:",
+    result.stdout,
+    "stderr:",
+    result.stderr,
+    "Confirm every load-bearing observation with read_file, diff_for_file, or diff_for_source_line.",
+  ].join("\n");
+}
+
+function hashValue(value: string): string {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < value.length; index++) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return (hash >>> 0).toString(36);
 }
 
 function inferEvidence(name: string, args: Record<string, unknown>, content: string): EvidenceResult {
@@ -1254,6 +1358,7 @@ const TOOL_ARGUMENT_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
   read_file: new Set(["path", "ref", "start_line", "end_line"]),
   search_code: new Set(["query", "path_prefix", "limit"]),
   dependency_source: new Set(["package", "query", "limit"]),
+  repository_terminal: new Set(["command"]),
 };
 
 function validateToolArguments(name: string, args: Record<string, unknown>): void {
@@ -1288,12 +1393,25 @@ function validateToolArguments(name: string, args: Record<string, unknown>): voi
     case "search_code":
       optionalStringArgument(args.path_prefix, "path_prefix");
       break;
+    case "repository_terminal":
+      if (args.command === undefined) throw new InvalidToolArgumentsError("command is required");
+      terminalCommandArgument(args.command);
+      break;
   }
 }
 
 function requiredString(value: unknown, name: string): string {
   if (typeof value !== "string" || !value.trim()) throw new InvalidToolArgumentsError(`${name} must be a non-empty string`);
   return value.trim();
+}
+
+function terminalCommandArgument(value: unknown): string {
+  const command = requiredString(value, "command");
+  try {
+    return validateRepositoryTerminalCommand(command);
+  } catch (error) {
+    throw new InvalidToolArgumentsError(error instanceof Error ? error.message : String(error));
+  }
 }
 
 class InvalidToolArgumentsError extends Error {

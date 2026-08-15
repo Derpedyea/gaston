@@ -3,7 +3,9 @@
   "name": "gaston-pr-reviewer",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-10",
-  "compatibility_flags": ["nodejs_compat"],
+  "compatibility_flags": ["nodejs_compat", "experimental"],
+
+  "worker_loaders": [{ "binding": "LOADER" }],
 
   "assets": {
     "directory": "./dist",
@@ -44,9 +46,9 @@
     "REVIEW_REQUIRE_ZDR": "false",
     "REVIEW_REASONING_EFFORT": "max",
     "REVIEW_MODEL_MAX_OUTPUT_TOKENS": "64000",
-    "REVIEW_DIRECT_DISCOVERY": "true",
+    "REVIEW_DIRECT_DISCOVERY": "false",
     "REVIEW_REQUIRE_INITIAL_TOOL_CALL": "false",
-    "REVIEW_MAX_EXPLORATION_TURNS": "1",
+    "REVIEW_MAX_EXPLORATION_TURNS": "2",
     "REVIEW_MAX_WALL_TIME_MS": "840000",
     "REVIEW_MODEL_TIMEOUT_MS": "660000",
     "REVIEW_MAX_MODEL_REQUESTS": "15",

@@ -207,12 +207,11 @@ and outcome for direct filtering in Workers Logs or `wrangler tail`.
 ## 8. Cost and rollout controls
 
 Start with one or two repositories. Queue concurrency is set to three and each
-tool result is bounded. With `REVIEW_DIRECT_DISCOVERY=true`, a complete diff
-that already fits the prompt uses one structured, tool-free issue-list request;
-candidate verification still receives harness-fetched exact anchors. A diff
-with omitted or truncated evidence retains the repository-agent path: one
-normal evidence turn, a four-call tool cap, and a tool-disabled finalization
-turn. A truncated or invalid result,
+tool result is bounded. The default `REVIEW_DIRECT_DISCOVERY=false` keeps the
+read-only Dynamic Worker terminal and exact repository tools available on every
+PR. Discovery gets one broad four-call turn and one targeted two-call follow-up
+before tool-disabled finalization; candidate verification still receives
+harness-fetched exact anchors. A truncated or invalid result,
 an exact-patch coverage shortfall, or an inventory-only first batch can unlock
 one focused two-call recovery batch. A new uncovered exact-patch continuation
 may unlock one final patch-only batch, under the eight-call phase ceiling.
@@ -255,9 +254,10 @@ Tune `wrangler.jsonc` only after observing real reviews:
   its provider at the same time rather than retaining the Luna-specific pin.
 - Review `REVIEW_MODEL_MAX_OUTPUT_TOKENS` whenever `REVIEW_MODEL` changes; it is
   a per-request policy ceiling, not automatic model-capability discovery.
-- Keep `REVIEW_DIRECT_DISCOVERY=true` for the shallow complete-diff path. Set it
-  to `false` only for a controlled comparison that intentionally restores
-  discovery-time repository browsing on every PR.
+- Keep `REVIEW_DIRECT_DISCOVERY=false` when repository-wide terminal navigation
+  is part of the review strategy. Set it to `true` only for a controlled
+  comparison of the shallow complete-diff path, which intentionally skips all
+  discovery-time repository tools when the diff fits in the prompt.
 - For model slugs that offer an `:exacto` variant, prefer it when tool-call
   reliability matters more than throughput-first routing; the default Luna
   slug has no such suffix, and an explicit OpenRouter provider sort overrides

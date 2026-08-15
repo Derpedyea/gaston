@@ -6,6 +6,7 @@ import {
   WorkspaceProxy,
   withWorkspace,
 } from "@cloudflare/computer";
+import { WorkerShellBackend } from "@cloudflare/computer/backends/worker-shell";
 
 import {
   DEFAULT_MAX_OUTPUT_TOKENS_PER_REQUEST,
@@ -98,10 +99,18 @@ interface ExecutionLease {
 const REVIEW_SESSION_KEY = "session:latest:v1";
 
 function workspaceOptions(self: InstanceType<typeof ReviewerBase>): WorkspaceOptions {
-  const { ctx } = self as unknown as { ctx: DurableObjectState };
+  const { ctx, env } = self as unknown as { ctx: DurableObjectState; env: Env };
   return {
     storage: ctx.storage as unknown as DurableObjectStorageLike,
     waitUntil: (promise) => ctx.waitUntil(promise),
+    backends: [
+      new WorkerShellBackend({
+        loader: env.LOADER,
+        workspace: { binding: "REVIEWER", id: ctx.id.toString() },
+        ctx,
+        compatibilityDate: "2026-08-10",
+      }),
+    ],
   };
 }
 

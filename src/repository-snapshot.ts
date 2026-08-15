@@ -178,6 +178,11 @@ export class RepositorySnapshot {
     }
   }
 
+  /** Internal mount target for Gaston's read-only Dynamic Worker terminal. */
+  filesRoot(): string {
+    return this.#filesRoot;
+  }
+
   async read(path: string): Promise<string | undefined> {
     const manifest = await this.#loadManifest();
     if (manifest === null || !manifest.files.some((file) => file.path === path)) return undefined;

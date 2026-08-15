@@ -210,6 +210,15 @@ describe("ReviewAgent", () => {
     expect(requests[0]!.temperature).toBeUndefined();
     expect(requests[0]!.session_id).toMatch(/^gaston:owner\/repo:discovery:/);
     expect(requests[1]!.session_id).toBe(requests[0]!.session_id);
+    const offeredTools = requests[0]!.tools as Array<{
+      function: { name: string; parameters: { properties?: Record<string, unknown> } };
+    }>;
+    expect(offeredTools.map((tool) => tool.function.name)).toContain("repository_terminal");
+    expect(offeredTools.find((tool) => tool.function.name === "repository_terminal"))
+      .toMatchObject({ function: { parameters: { properties: { command: { maxLength: 2_000 } } } } });
+    const firstMessages = requests[0]!.messages as Array<{ role: string; content: string }>;
+    expect(firstMessages[0]!.content).toContain("read-only simulated shell");
+    expect(firstMessages[0]!.content).toContain("GASTON-OBSERVATION");
   });
 
   it("does not let a failed tool satisfy required repository evidence", async () => {

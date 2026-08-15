@@ -92,10 +92,12 @@ does not pretend an LLM replaces tests, static analysis, or security scanning.
 2. Drop drafts, irrelevant actions, duplicates, and stale SHAs.
 3. Fetch changed-file patches and repository evidence through a short-lived
    installation token; do not clone or execute repository code.
-4. Cache only bounded evidence in Computer's per-PR SQLite workspace.
-5. Run a custom OpenRouter tool loop with no arbitrary URLs, writes, or commands.
-6. Run one bounded discovery pass across behavior, security, state, and
-   operations, then force a tool-disabled structured result.
+4. Cache an exact, bounded head snapshot in Computer's per-PR SQLite workspace.
+5. Give discovery a read-only Dynamic Worker terminal over only that snapshot;
+   retain exact file/patch tools as the sole citable evidence boundary.
+6. Run one broad discovery pass and at most one targeted follow-up across
+   behavior, security, state, and operations, then force a tool-disabled
+   structured result.
 7. Independently verify surviving candidates in a fresh pass, merging
    duplicates and rejecting claims that do not survive repository inspection.
 8. Enforce confidence, deduplication, exact changed-line membership, and the
@@ -105,17 +107,18 @@ does not pretend an LLM replaces tests, static analysis, or security scanning.
 10. On later pushes, immediately supersede older work and review the cumulative
     base-to-current-head change before updating one persistent PR summary.
 
-## Why filesystem-only Computer
+## Why Computer plus a Dynamic Worker shell
 
-Cloudflare Computer officially supports a
-[filesystem-only workspace](https://github.com/cloudflare/computer) with no
-execution backend. That is the smallest useful layer here: it gives each PR a
-durable, isolated cache using the same SQLite storage as its Durable Object.
-A Linux container was required only to run an external Pi CLI and Git process;
-the custom harness needs neither. Computer's Worker JavaScript backend was also
-considered, but dynamically loading a fixed, trusted harness would add another
-execution boundary and cost without improving isolation from the host that
-already owns the GitHub and OpenRouter credentials.
+Cloudflare Computer provides the durable SQLite workspace and an on-demand
+[Worker-shell backend](https://github.com/cloudflare/computer) implemented with
+`just-bash` in a Dynamic Worker. This preserves the `rg`/`grep`/`find` workflow
+agents use for broad code navigation without paying for or maintaining a Linux
+container. Gaston overrides Computer's default workspace service capability:
+the shell receives only a read-only `/workspace` projection of the current
+exact-head snapshot, cannot escape that root, has no Git/artifact capability,
+and has no outbound network. Terminal output is discovery routing only; exact
+file and changed-patch tools remain the verifier's evidence interface. Project
+code, tests, linters, package managers, and CI commands are not executed.
 
 ## Cost posture
 
