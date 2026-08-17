@@ -10,11 +10,21 @@ import type { RepositoryArchive } from "./repository-snapshot.ts";
 import { formatBudgetSummary, type ReviewBudgetSnapshot } from "./budget.ts";
 import type { EvidenceCoverage } from "./evidence.ts";
 import { shouldRequestChanges } from "./review-core.ts";
+import {
+  findingFingerprint,
+  findingFingerprintFromParts,
+  type FindingThread,
+  type ReviewLedgerFinding,
+  parseFindingMarker,
+  parseLegacyFindingHeading,
+  renderFindingMarker,
+} from "./review-evolution.ts";
 
 const MAX_RETAINED_PATCH_BYTES = 2_000_000;
 const API = "https://api.github.com";
 const API_VERSION = "2026-03-10";
 const CHECK_NAME = "Gaston review";
+const VERDICT_CHECK_NAME = "Gaston verdict";
 const RECONCILIATION_LOOKUP_BACKOFF_MS = [100, 300, 900] as const;
 
 type Delay = (delayMs: number) => Promise<void>;
@@ -95,11 +105,52 @@ interface CheckRun {
 }
 
 interface CheckRunsResponse { check_runs: CheckRun[] }
+interface CompareCommitsResponse {
+  files?: Array<{
+    filename: string;
+    previous_filename?: string;
+    status: string;
+    additions: number;
+    deletions: number;
+    patch?: string;
+  }>;
+}
+
+interface ReviewThreadsResponse {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        reviewThreads?: {
+          pageInfo: { hasNextPage: boolean; endCursor: string | null };
+          nodes: Array<{
+            id: string;
+            isResolved: boolean;
+            isOutdated: boolean;
+            path: string;
+            line: number | null;
+            originalLine: number | null;
+            comments: {
+              nodes: Array<{
+                body: string;
+                author: { login: string } | null;
+              } | null>;
+            };
+          } | null>;
+        };
+      };
+    };
+  };
+  errors?: Array<{ message?: string }>;
+}
 export interface PullReview {
   id?: number;
   body: string | null;
   commit_id: string;
   user?: GitHubActor | null;
+}
+export interface VerdictCheckInput {
+  outstandingFindings: readonly ReviewLedgerFinding[];
+  priorContextComplete: boolean;
 }
 export interface ReviewComparisonIdentity { baseSha: string; headSha: string }
 export interface PublishedReviewReconciliation {
@@ -120,13 +171,39 @@ export interface QueuedCheckReconciliation {
   superseded: boolean;
   supersedeError?: unknown;
 }
+
+const FINDING_THREADS_QUERY = `
+query GastonFindingThreads($owner: String!, $repo: String!, $pull: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pull) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          path
+          line
+          originalLine
+          comments(first: 50) {
+            nodes { body author { login } }
+          }
+        }
+      }
+    }
+  }
+}
+`;
 interface IssueComment {
   id: number;
   body: string | null;
   user?: GitHubActor | null;
   performed_via_github_app?: { id?: number } | null;
 }
-interface ReviewSummaryOptions { preserveExistingOnClean?: boolean }
+interface ReviewSummaryOptions {
+  preserveExistingOnClean?: boolean;
+  outstandingFindings?: readonly ReviewLedgerFinding[];
+}
 interface PullFileResponse {
   filename: string;
   previous_filename?: string;
@@ -247,6 +324,95 @@ export class GitHubClient {
     );
   }
 
+  /**
+   * Load a bounded previous-head-to-current-head overlay for routing only.
+   * GitHub caps compare-file output, so callers must never use this result as
+   * cumulative review coverage or as proof that an older finding was fixed.
+   */
+  async getIncrementalChanges(
+    job: ReviewJob,
+    previousHeadSha: string,
+    signal?: AbortSignal,
+  ): Promise<PullChangeSet | undefined> {
+    if (!/^[a-f0-9]{40}$/i.test(previousHeadSha)) return undefined;
+    if (previousHeadSha === job.headSha) return createChangeSet([], false, false);
+    const response = await this.request<CompareCommitsResponse>(
+      `/repos/${job.owner}/${job.repo}/compare/${encodeURIComponent(previousHeadSha)}...${encodeURIComponent(job.headSha)}?per_page=100&page=1`,
+      signalInit(signal),
+    );
+    if (!Array.isArray(response.files)) return undefined;
+    const files = response.files.map((file): PullFileChange => ({
+      path: file.filename,
+      ...(file.previous_filename === undefined ? {} : { previousPath: file.previous_filename }),
+      status: file.status,
+      additions: file.additions,
+      deletions: file.deletions,
+      patch: file.patch ?? null,
+    }));
+    const sourceCapped = files.length >= 100;
+    return createChangeSet(files, sourceCapped, files.some((file) => file.patch === null));
+  }
+
+  async listFindingThreads(job: ReviewJob, signal?: AbortSignal): Promise<FindingThread[]> {
+    const threads: FindingThread[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < 50; page++) {
+      const response: ReviewThreadsResponse = await this.request<ReviewThreadsResponse>("/graphql", {
+        method: "POST",
+        body: JSON.stringify({
+          query: FINDING_THREADS_QUERY,
+          variables: { owner: job.owner, repo: job.repo, pull: job.pullNumber, cursor },
+        }),
+        ...signalInit(signal),
+      });
+      if (response.errors?.length) {
+        throw new GitHubApiError(
+          "POST",
+          "/graphql",
+          502,
+          response.errors.map((error: { message?: string }) => error.message ?? "unknown GraphQL error").join("; ").slice(0, 1_000),
+        );
+      }
+      const connection: NonNullable<
+        NonNullable<NonNullable<NonNullable<ReviewThreadsResponse["data"]>["repository"]>["pullRequest"]>["reviewThreads"]
+      > | undefined = response.data?.repository?.pullRequest?.reviewThreads;
+      if (!connection) {
+        throw new GitHubApiError("POST", "/graphql", 502, "GitHub did not return pull-request review threads");
+      }
+      for (const node of connection.nodes) {
+        if (!node) continue;
+        const comments = node.comments.nodes.filter((comment): comment is NonNullable<typeof comment> => comment !== null);
+        const root = comments[0];
+        if (!root || !isAppLogin(root.author?.login, this.#appIdentity)) continue;
+        const legacy = parseLegacyFindingHeading(root.body);
+        const marker = parseFindingMarker(root.body);
+        if (!marker && !legacy) continue;
+        const title = legacy?.title ?? "Gaston finding";
+        threads.push({
+          threadId: node.id,
+          fingerprint: marker ?? findingFingerprintFromParts(node.path, title),
+          path: node.path,
+          line: node.line ?? node.originalLine ?? 1,
+          title,
+          severity: legacy?.severity ?? "medium",
+          resolved: node.isResolved,
+          outdated: node.isOutdated,
+          body: root.body.slice(0, 4_000),
+          replies: comments.slice(1, 20).map((comment) => ({
+            author: comment.author?.login ?? "unknown",
+            body: comment.body.slice(0, 2_000),
+          })),
+        });
+      }
+      if (!connection.pageInfo.hasNextPage || !connection.pageInfo.endCursor) break;
+      if (page === 49) {
+        throw new GitHubApiError("POST", "/graphql", 502, "Gaston review threads exceeded the bounded pagination window");
+      }
+      cursor = connection.pageInfo.endCursor;
+    }
+    return threads;
+  }
+
   async getRepositoryTree(
     job: ReviewJob,
     ref: string,
@@ -357,7 +523,7 @@ export class GitHubClient {
     }>(`/repos/${job.owner}/${job.repo}/commits/${job.headSha}/check-runs?per_page=100`, signalInit(signal));
 
     return result.check_runs
-      .filter((check) => check.name !== CHECK_NAME)
+      .filter((check) => check.name !== CHECK_NAME && check.name !== VERDICT_CHECK_NAME)
       .map((check) => ({
         name: check.name,
         status: check.status,
@@ -517,17 +683,26 @@ export class GitHubClient {
   }
 
   async #findLiveCheckRun(job: ReviewJob, signal?: AbortSignal): Promise<CheckRun | undefined> {
+    return this.#findCheckRun(job, CHECK_NAME, checkMarker(job), false, signal);
+  }
+
+  async #findCheckRun(
+    job: ReviewJob,
+    name: string,
+    externalId: string,
+    includeCompleted: boolean,
+    signal?: AbortSignal,
+  ): Promise<CheckRun | undefined> {
     const current = await this.request<CheckRunsResponse>(
-      `/repos/${job.owner}/${job.repo}/commits/${job.headSha}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}&per_page=100`,
+      `/repos/${job.owner}/${job.repo}/commits/${job.headSha}/check-runs?check_name=${encodeURIComponent(name)}&per_page=100`,
       signalInit(signal),
     );
-    const externalId = checkMarker(job);
     return current.check_runs.find((check) => (
-      check.external_id === externalId && check.status !== "completed"
+      check.external_id === externalId && (includeCompleted || check.status !== "completed")
     ));
   }
 
-  completeCheck(
+  completeRunCheck(
     job: ReviewJob,
     checkRunId: number,
     review: ReviewOutput,
@@ -543,14 +718,17 @@ export class GitHubClient {
         ...checkDetails(job),
         status: "completed",
         completed_at: new Date().toISOString(),
-        conclusion: findingCount === 0 && !incomplete ? "success" : "neutral",
+        conclusion: "success",
         output: {
-          title: incomplete && findingCount === 0
-            ? "Review evidence incomplete"
-            : findingCount === 0
-            ? "No actionable bugs found"
-            : `${findingCount} high-confidence ${findingCount === 1 ? "finding" : "findings"}`,
+          title: "Review run completed",
           summary: [
+            incomplete
+              ? "The review process completed, but the separate Gaston verdict remains neutral because evidence was incomplete."
+              : findingCount === 0
+              ? "The review process completed without a new verified finding."
+              : `The review process completed with ${findingCount} verified ${findingCount === 1 ? "finding" : "findings"}.`,
+            "Merge-readiness is reported by the separate Gaston verdict check when enabled.",
+            "",
             renderSummary(review),
             ...(coverage === undefined ? [] : ["", renderCoverage(coverage)]),
             ...(budget === undefined ? [] : ["", `_Resource use: ${formatBudgetSummary(budget)}._`]),
@@ -559,6 +737,70 @@ export class GitHubClient {
       }),
       ...signalInit(signal),
     });
+  }
+
+  /** @deprecated Use completeRunCheck plus upsertVerdictCheck. */
+  completeCheck(
+    job: ReviewJob,
+    checkRunId: number,
+    review: ReviewOutput,
+    budget?: ReviewBudgetSnapshot,
+    coverage?: EvidenceCoverage,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    return this.completeRunCheck(job, checkRunId, review, budget, coverage, signal);
+  }
+
+  async upsertVerdictCheck(
+    job: ReviewJob,
+    review: ReviewOutput,
+    coverage: EvidenceCoverage,
+    input: VerdictCheckInput,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
+    const currentFingerprints = new Set(review.findings.map(findingFingerprint));
+    for (const finding of input.outstandingFindings) currentFingerprints.add(finding.fingerprint);
+    const findingCount = currentFingerprints.size;
+    const incomplete = !coverage.sufficient || !input.priorContextComplete;
+    const conclusion = incomplete ? "neutral" : findingCount > 0 ? "failure" : "success";
+    const title = incomplete
+      ? "Review verdict incomplete"
+      : findingCount > 0
+      ? `${findingCount} outstanding verified ${findingCount === 1 ? "finding" : "findings"}`
+      : "No outstanding verified findings";
+    const body = {
+      name: VERDICT_CHECK_NAME,
+      head_sha: job.headSha,
+      external_id: verdictMarker(job),
+      ...checkDetails(job),
+      status: "completed",
+      completed_at: new Date().toISOString(),
+      conclusion,
+      output: {
+        title,
+        summary: [
+          incomplete
+            ? "Gaston could not establish a complete merge-readiness verdict."
+            : findingCount > 0
+            ? "Verified current findings or unresolved prior Gaston feedback remain on this pull request."
+            : "Cumulative review coverage is sufficient and no verified current or prior Gaston finding remains open.",
+          ...(!input.priorContextComplete ? ["Prior Gaston review-thread state was unavailable."] : []),
+          ...(coverage.limitations.length > 0 ? ["", renderCoverage(coverage)] : []),
+        ].join("\n").slice(0, 60_000),
+      },
+    };
+    const existing = await this.#findCheckRun(job, VERDICT_CHECK_NAME, verdictMarker(job), true, signal);
+    return existing === undefined
+      ? this.request(`/repos/${job.owner}/${job.repo}/check-runs`, {
+          method: "POST",
+          body: JSON.stringify(body),
+          ...signalInit(signal),
+        })
+      : this.request(`/repos/${job.owner}/${job.repo}/check-runs/${existing.id}`, {
+          method: "PATCH",
+          body: JSON.stringify(body),
+          ...signalInit(signal),
+        });
   }
 
   failCheck(job: ReviewJob, checkRunId: number, error: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -770,10 +1012,18 @@ export class GitHubClient {
       ));
       if (existing || comments.length < 100) break;
     }
-    if (!existing && review.findings.length === 0) return;
-    if (existing && review.findings.length === 0 && options.preserveExistingOnClean === true) return;
+    const currentFingerprints = new Set(review.findings.map(findingFingerprint));
+    const outstanding = (options.outstandingFindings ?? [])
+      .filter((finding) => !currentFingerprints.has(finding.fingerprint));
+    if (!existing && review.findings.length === 0 && outstanding.length === 0) return;
+    if (
+      existing
+      && review.findings.length === 0
+      && outstanding.length === 0
+      && options.preserveExistingOnClean === true
+    ) return;
 
-    const body = `${marker}\n${renderSummary(review)}\n\n_Last reviewed commit: \`${job.headSha.slice(0, 12)}\`._`;
+    const body = `${marker}\n${renderSummary(review, outstanding)}\n\n_Last reviewed commit: \`${job.headSha.slice(0, 12)}\`._`;
     if (existing) {
       await this.request(`/repos/${job.owner}/${job.repo}/issues/comments/${existing.id}`, {
         method: "PATCH",
@@ -913,6 +1163,10 @@ function checkMarker(job: ReviewJob): string {
   return `${reviewMarker(job)}:${execution}`;
 }
 
+function verdictMarker(job: ReviewJob): string {
+  return `gaston-verdict:${job.pullNumber}:${job.baseSha}:${job.headSha}`;
+}
+
 function sameReviewComparison(job: ReviewJob, desired: ReviewComparisonIdentity): boolean {
   return desired.baseSha === job.baseSha && desired.headSha === job.headSha;
 }
@@ -942,11 +1196,20 @@ function checkDetails(job: ReviewJob): { details_url?: string } {
   }
 }
 
-function renderSummary(review: ReviewOutput): string {
+function renderSummary(
+  review: ReviewOutput,
+  outstandingFindings: readonly ReviewLedgerFinding[] = [],
+): string {
   const lines = [review.summary];
   if (review.findings.length > 0) {
     lines.push("", "### Findings");
     for (const finding of review.findings) {
+      lines.push(`- **${finding.severity.toUpperCase()}** \`${finding.path}:${finding.line}\` — ${finding.title}`);
+    }
+  }
+  if (outstandingFindings.length > 0) {
+    lines.push("", "### Outstanding prior feedback");
+    for (const finding of outstandingFindings.slice(0, 20)) {
       lines.push(`- **${finding.severity.toUpperCase()}** \`${finding.path}:${finding.line}\` — ${finding.title}`);
     }
   }
@@ -956,6 +1219,7 @@ function renderSummary(review: ReviewOutput): string {
 
 function renderInlineFinding(finding: Finding): string {
   return [
+    renderFindingMarker(finding),
     `**${finding.severity.toUpperCase()}: ${finding.title}**`,
     "",
     finding.why,
@@ -966,6 +1230,10 @@ function renderInlineFinding(finding: Finding): string {
     "",
     `Confidence: ${Math.round(finding.confidence * 100)}%`,
   ].join("\n").slice(0, 60_000);
+}
+
+function isAppLogin(login: string | undefined, identity: GitHubAppIdentity): boolean {
+  return typeof login === "string" && login.toLowerCase() === identity.botLogin.toLowerCase();
 }
 
 async function githubRequest<T>(path: string, token: string, init: RequestInit = {}): Promise<T> {

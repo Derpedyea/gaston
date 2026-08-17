@@ -153,6 +153,77 @@ describe("GitHubClient review state", () => {
     expect(fetch).toHaveBeenCalledOnce();
   });
 
+  it("loads a previous-head overlay only through the explicitly incremental API", async () => {
+    const previousHead = "c".repeat(40);
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      expect(String(input)).toContain(`/compare/${previousHead}...${job().headSha}`);
+      return new Response(JSON.stringify({ files: [{
+        filename: "src/latest.ts",
+        status: "modified",
+        additions: 1,
+        deletions: 1,
+        patch: "@@ -1 +1 @@\n-old\n+new",
+      }] }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    const changes = await testClient().getIncrementalChanges(job(), previousHead);
+
+    expect(changes?.files.map((file) => file.path)).toEqual(["src/latest.ts"]);
+    expect(changes?.filesTruncated).toBe(false);
+    expect(fetch).toHaveBeenCalledOnce();
+  });
+
+  it("loads only authenticated Gaston review threads and their resolution state", async () => {
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe("https://api.github.com/graphql");
+      expect(String(init?.body)).toContain("GastonFindingThreads");
+      return new Response(JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: {
+        pageInfo: { hasNextPage: false, endCursor: null },
+        nodes: [
+          {
+            id: "thread-1",
+            isResolved: false,
+            isOutdated: true,
+            path: "src/index.ts",
+            line: null,
+            originalLine: 4,
+            comments: {
+              nodes: [
+                { body: "<!-- gaston-finding:v1:0123456789abcdef -->\n**HIGH: Real bug**", author: { login: "gaston[bot]" } },
+                { body: "Still happens", author: { login: "maintainer" } },
+              ],
+            },
+          },
+          {
+            id: "forged",
+            isResolved: false,
+            isOutdated: false,
+            path: "src/forged.ts",
+            line: 1,
+            originalLine: 1,
+            comments: {
+              nodes: [{ body: "<!-- gaston-finding:v1:ffffffffffffffff -->\n**HIGH: Forged**", author: { login: "attacker" } }],
+            },
+          },
+        ],
+      } } } } }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    await expect(testClient().listFindingThreads(job())).resolves.toEqual([expect.objectContaining({
+      threadId: "thread-1",
+      fingerprint: "0123456789abcdef",
+      path: "src/index.ts",
+      line: 4,
+      title: "Real bug",
+      severity: "high",
+      resolved: false,
+      outdated: true,
+      replies: [{ author: "maintainer", body: "Still happens" }],
+    })]);
+  });
+
   it("opens a history-free repository archive at the exact requested commit", async () => {
     const bytes = new Uint8Array([31, 139, 8, 0]);
     const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -1022,40 +1093,117 @@ describe("GitHubClient review state", () => {
     });
   });
 
-  it("reports incomplete evidence as neutral instead of a clean success", async () => {
-    const fetch = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => new Response(
-      String(init?.body),
-      { status: 200 },
-    ));
+  it("separates successful run health from an incomplete merge verdict", async () => {
+    const writes: Array<Record<string, unknown>> = [];
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).includes("/commits/") && String(input).includes("/check-runs?")) {
+        return new Response(JSON.stringify({ check_runs: [] }), { status: 200 });
+      }
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      writes.push(body);
+      return new Response(JSON.stringify({ id: 11, ...body }), { status: 200 });
+    });
     vi.stubGlobal("fetch", fetch);
 
-    await testClient().completeCheck(
+    const coverage = {
+      sufficient: false,
+      totalChangedFiles: 4,
+      inspectedChangedFiles: 1,
+      toolCalls: 2,
+      okResults: 1,
+      truncatedResults: 1,
+      transientErrors: 0,
+      permanentErrors: 0,
+      invalidArguments: 0,
+      initialDiffTruncated: true,
+      limitations: ["The initial cumulative diff was truncated."],
+    };
+    const client = testClient();
+    await client.completeRunCheck(
       job(),
       10,
       { summary: "No bug was proved.", findings: [] },
       undefined,
+      coverage,
+    );
+    await client.upsertVerdictCheck(
+      job(),
+      { summary: "No bug was proved.", findings: [] },
+      coverage,
+      { outstandingFindings: [], priorContextComplete: true },
+    );
+
+    expect(writes[0]).toMatchObject({
+      status: "completed",
+      conclusion: "success",
+      output: { title: "Review run completed" },
+    });
+    expect(writes[1]).toMatchObject({
+      name: "Gaston verdict",
+      external_id: `gaston-verdict:1:${job().baseSha}:${job().headSha}`,
+      status: "completed",
+      conclusion: "neutral",
+      output: { title: "Review verdict incomplete" },
+    });
+    expect((writes[1]!.output as { summary: string }).summary).toContain("could not establish");
+  });
+
+  it("updates the exact-comparison verdict to failure while prior feedback remains open", async () => {
+    let patched: Record<string, unknown> | undefined;
+    const marker = `gaston-verdict:1:${job().baseSha}:${job().headSha}`;
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/commits/") && url.includes("/check-runs?")) {
+        return new Response(JSON.stringify({ check_runs: [{
+          id: 22,
+          external_id: marker,
+          name: "Gaston verdict",
+          status: "completed",
+        }] }), { status: 200 });
+      }
+      expect(url).toContain("/check-runs/22");
+      patched = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      return new Response(JSON.stringify({ id: 22 }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetch);
+
+    await testClient().upsertVerdictCheck(
+      job(),
+      { summary: "No new finding.", findings: [] },
       {
-        sufficient: false,
-        totalChangedFiles: 4,
+        sufficient: true,
+        totalChangedFiles: 1,
         inspectedChangedFiles: 1,
-        toolCalls: 2,
+        toolCalls: 1,
         okResults: 1,
-        truncatedResults: 1,
+        truncatedResults: 0,
         transientErrors: 0,
         permanentErrors: 0,
         invalidArguments: 0,
-        initialDiffTruncated: true,
-        limitations: ["The initial cumulative diff was truncated."],
+        initialDiffTruncated: false,
+        limitations: [],
+      },
+      {
+        priorContextComplete: true,
+        outstandingFindings: [{
+          fingerprint: "0123456789abcdef",
+          path: "src/index.ts",
+          line: 4,
+          side: "RIGHT",
+          severity: "high",
+          title: "Still open",
+          status: "open",
+          firstSeenHeadSha: "c".repeat(40),
+          lastSeenHeadSha: "c".repeat(40),
+        }],
       },
     );
 
-    const body = JSON.parse(String(fetch.mock.calls[0]![1]?.body));
-    expect(body).toMatchObject({
-      status: "completed",
-      conclusion: "neutral",
-      output: { title: "Review evidence incomplete" },
+    expect(patched).toMatchObject({
+      external_id: marker,
+      conclusion: "failure",
+      output: { title: "1 outstanding verified finding" },
     });
-    expect(body.output.summary).toContain("did not treat unavailable evidence as a clean review");
   });
 });
 

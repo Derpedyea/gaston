@@ -44,10 +44,18 @@ validation.
   endpoint through its documented 3,000-file ceiling. Large inventories remain
   page-accessible to the agent, and omitted patches or an API-capped listing are
   reported as incomplete evidence rather than a clean review.
-- **Deep and low-noise:** one bounded discovery pass targets the riskiest
-  behavior, security, state, and operations paths; a separate cold same-model
-  verifier returns an explicit `confirmed`, `refuted`, or `insufficient`
-  verdict for every changed-line candidate.
+- **Deep and low-noise:** one full cumulative discovery pass plus at most two
+  deterministic high-risk lanes inspect security, state, data, API, or
+  operational hotspots; every candidate still passes through a separate cold
+  verifier with an explicit `confirmed`, `refuted`, or `insufficient` verdict.
+- **Evolution aware:** a durable per-PR ledger carries unresolved Gaston
+  findings across commits, imports authenticated GitHub thread resolution, and
+  avoids reposting the same open finding. A previous-head diff is used only as
+  a routing overlay; the cumulative base-to-head diff remains authoritative.
+- **Merge-ready signaling:** `Gaston review` reports whether the review process
+  ran successfully, while the exact-head `Gaston verdict` separately reports
+  success, failure for outstanding verified findings, or neutral when evidence
+  or prior-thread state is incomplete.
 - **Repository aware:** reads relevant files and searches code at the exact
   base or head commit instead of reasoning from an isolated diff.
 - **Safe by construction:** exposes bounded exact-source tools plus a
@@ -66,7 +74,7 @@ flowchart LR
   DO <--> FS[Computer workspace]
   DO -->|read-only repository navigation| DW[Dynamic Worker shell]
   DO -->|bounded reads| GH
-  DO -->|bounded discovery + verifier| OR[OpenRouter / GPT-5.6 Luna]
+  DO -->|full discovery + risk lanes + cold verifier| OR[OpenRouter / GPT-5.6 Luna]
   DO -->|changed-line findings| GH
 ```
 
@@ -87,7 +95,12 @@ repository paths, read bounded file slices, perform literal code searches, and
 run short `rg`/`grep`/`find`/`sed`-style navigation commands against the
 read-only exact-head snapshot. Terminal output is always a non-citable
 observation; a finding or verifier verdict must retrieve its load-bearing lines
-again through an exact file or patch tool. Discovery receives one broad
+again through an exact file or patch tool. Before inference, deterministic
+changed-symbol searches build a bounded, advisory change-impact map. Gaston
+then runs the full cumulative discovery and up to two independently prompted
+risk lanes selected from changed-code and path signals. Lane candidates are
+merged before verification; lane output never bypasses exact changed-line
+validation or the cold verifier. Each discovery agent receives one broad
 evidence turn with at most four parallel calls and one optional targeted
 follow-up with at most two calls, then a tool-disabled final turn. A truncated
 or invalid result, an exact-patch coverage shortfall, or an
@@ -125,8 +138,9 @@ Saved benchmark artifacts can be re-evaluated without inference with
 `bun run eval:replay-verification <artifact.json>`.
 Discovery reads cannot masquerade as independent verification. Omitted,
 malformed, invented, or still-incomplete evidence fails closed as
-`insufficient`, never as a silent veto, and any unresolved candidate keeps the
-terminal GitHub check neutral rather than green.
+`insufficient`, never as a silent veto. The durable finding ledger also fails
+closed when authenticated prior-thread state cannot be loaded: the review run
+can complete, but the separate merge verdict remains neutral.
 Provider reasoning state—including meaningful empty DeepSeek reasoning—is preserved
 across tool calls. Exact reads are memoized, prompts are capped at 72 KB, tool
 results are capped at 12 KB, and history is compacted to a 120 KB carried-context
@@ -152,8 +166,10 @@ results, and anything over the configured finding cap.
 
 Tool responses carry typed `ok`, `truncated`, `invalid_arguments`,
 `permanent_error`, or `transient_error` outcomes. Gaston publishes a successful
-clean check only when evidence coverage is sufficient; incomplete evidence ends
-neutral and lists its limitations. The latest requested head, execution
+run-health check when the process finishes. Its separate exact-head verdict is
+green only when evidence coverage and prior-thread reconciliation are complete
+and no verified finding remains open; it is red for outstanding findings and
+neutral for incomplete evidence. The latest requested head, execution
 generation, check run, and phase are persisted before work proceeds, so a
 Durable Object restart cannot make an older execution current again.
 
@@ -207,6 +223,10 @@ permissions, installation, verification, and troubleshooting.
 | `REVIEW_DIRECT_DISCOVERY` | `false` | Keep repository navigation available on every PR. Set to `true` only for a controlled shallow-path comparison that uses one tool-free issue-list pass when the complete changed code fits the prompt |
 | `REVIEW_REQUIRE_INITIAL_TOOL_CALL` | `false` | Require at least one repository evidence call before accepting a model verdict |
 | `REVIEW_MAX_EXPLORATION_TURNS` | `2` | One broad navigation/evidence turn plus one candidate-targeted exact-evidence follow-up |
+| `REVIEW_RISK_LANES` | `true` | Enable independent deterministic specialist discovery lanes before cold verification |
+| `REVIEW_MAX_RISK_LANES` | `2` | Maximum dispatched risk lanes; bounded to `0`–`2` |
+| `REVIEW_RISK_LANE_MAX_OUTPUT_TOKENS` | `16000` | Per-attempt completion ceiling for each specialist lane |
+| `REVIEW_VERDICT_CHECK` | `true` | Publish the separate exact-head `Gaston verdict` check for merge policy |
 | `REVIEW_MIN_CONFIDENCE` | `0.80` | Minimum confidence for each independently verified, candidate-bound finding; unrelated incomplete candidates do not raise it |
 | `REVIEW_INCOMPLETE_EVIDENCE_MIN_CONFIDENCE` | `0.88` | Aggregate incomplete-evidence fallback retained for non-candidate policy checks; an unresolved verifier candidate is withheld instead of raising other candidates' thresholds |
 | `REVIEW_MAX_FINDINGS` | `8` | Maximum inline findings per review |

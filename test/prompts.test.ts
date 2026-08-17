@@ -29,6 +29,47 @@ describe("review prompt budgets", () => {
     expect(prompt).toContain('"falsifier"');
   });
 
+  it("labels risk routing and PR-evolution context as advisory", () => {
+    const prompt = discoveryPrompt(job(), changes("@@ -1 +1 @@\n-old\n+new"), [], "", REVIEW_LENS, {
+      impact: {
+        lanes: [{
+          id: "auth-security",
+          focus: "authorization boundaries",
+          paths: ["src/auth.ts"],
+          score: 5,
+          reasons: ["path signal"],
+        }],
+        symbols: [{
+          symbol: "authorize",
+          changedPaths: ["src/auth.ts"],
+          references: [{ path: "src/caller.ts", line: 8 }],
+        }],
+        searchComplete: true,
+        searchedSymbols: 1,
+      },
+      evolution: {
+        previousReviewedHeadSha: "c".repeat(40),
+        incrementalChanges: changes("@@ -1 +1 @@\n-old\n+new"),
+        outstandingFindings: [],
+        threads: [],
+        threadContextComplete: true,
+      },
+      lane: {
+        id: "auth-security",
+        focus: "authorization boundaries",
+        paths: ["src/auth.ts"],
+        score: 5,
+        reasons: ["path signal"],
+      },
+    });
+
+    expect(prompt).toContain("independent, cold risk-lane reviewer");
+    expect(prompt).toContain("advisory and non-citable");
+    expect(prompt).toContain("prioritization only");
+    expect(prompt).toContain("cannot narrow cumulative coverage");
+    expect(prompt).toContain("src/caller.ts:8");
+  });
+
   it("bounds oversized verification candidates without losing the output contract", () => {
     const prompt = verificationPrompt(
       job(),

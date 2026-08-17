@@ -14,7 +14,7 @@ import {
   ReviewAgent,
   reviewProviderRouteFromEnv,
 } from "./agent.ts";
-import type { EvidenceCoverage } from "./evidence.ts";
+import { mergeEvidenceCoverage, type EvidenceCoverage } from "./evidence.ts";
 import {
   DEFAULT_REVIEW_BUDGET,
   formatBudgetSummary,
@@ -32,9 +32,26 @@ import {
   runOwnedOperations,
   shouldInterruptForAcceptedClaim,
 } from "./coordinator.ts";
-import { GitHubClient, type ReviewComparisonIdentity } from "./github.ts";
+import {
+  GitHubClient,
+  type PullReview,
+  type ReviewComparisonIdentity,
+} from "./github.ts";
 import { errorMessage, logError, logInfo } from "./log.ts";
 import { discoveryPrompt, REVIEW_LENS } from "./prompts.ts";
+import {
+  buildChangeImpactMap,
+  changeSetForLane,
+} from "./change-impact.ts";
+import {
+  buildReviewLedger,
+  findingsNeedingInlineComment,
+  type FindingThread,
+  outstandingPriorFindings,
+  REVIEW_LEDGER_STORAGE_KEY,
+  type ReviewEvolutionContext,
+  type ReviewLedger,
+} from "./review-evolution.ts";
 import {
   filterFindings,
   parseChangedFileLines,
@@ -568,10 +585,23 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
           });
         }
       }
+      const previousLedger = await this.ctx.storage.get<ReviewLedger>(REVIEW_LEDGER_STORAGE_KEY);
+      const threadState = await loadFindingThreads(github, job, signal);
+      const outstandingFindings = outstandingPriorFindings(previousLedger, threadState.threads);
+      inlineFindings = findingsNeedingInlineComment(inlineFindings, outstandingFindings);
+      if (!threadState.complete) {
+        coverage = addCoverageLimitation(
+          coverage,
+          "Prior Gaston review-thread state was unavailable; unresolved feedback could not be reconciled.",
+        );
+      }
       logInfo("review.analysis_ready", {
         ...reviewLogFields(job),
         cached: cachedAnalysis,
         findings: review.findings.length,
+        newInlineFindings: inlineFindings.length,
+        outstandingPriorFindings: outstandingFindings.length,
+        priorThreadContextComplete: threadState.complete,
         coverageSufficient: coverage.sufficient,
         coverageLimitations: coverage.limitations,
       });
@@ -606,8 +636,12 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         }
       }
 
-      type TerminalOperation = "publish-review" | "upsert-summary" | "complete-check";
-      let publishedReview: unknown;
+      type TerminalOperation =
+        | "publish-review"
+        | "upsert-summary"
+        | "complete-run-check"
+        | "publish-verdict-check";
+      let publishedReview: PullReview | undefined;
       const terminalOperations: Array<OwnedOperation<TerminalOperation>> = [];
       if (publishInlineReview) {
         terminalOperations.push({
@@ -628,18 +662,30 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
           run: async () => {
             await github.upsertReviewSummary(job, review, signal, {
               preserveExistingOnClean: preserveExistingSummary,
+              outstandingFindings,
             }).catch((error) => {
               logError("review.summary_failed", { ...reviewLogFields(job), error: errorMessage(error) });
             });
           },
         },
         {
-          name: "complete-check",
+          name: "complete-run-check",
           run: async () => {
-            await github.completeCheck(job, checkRunId, review, budget.snapshot(), coverage, signal);
+            await github.completeRunCheck(job, checkRunId, review, budget.snapshot(), coverage, signal);
           },
         },
       );
+      if (booleanSetting(this.env.REVIEW_VERDICT_CHECK, true)) {
+        terminalOperations.push({
+          name: "publish-verdict-check",
+          run: async () => {
+            await github.upsertVerdictCheck(job, review, coverage, {
+              outstandingFindings,
+              priorContextComplete: threadState.complete,
+            }, signal);
+          },
+        });
+      }
       const terminalResult = await runOwnedOperations(
         () => this.#ownsLease(lease, signal),
         terminalOperations,
@@ -732,6 +778,14 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         findings: review.findings.length,
         headSha: job.headSha,
       };
+      const ledger = buildReviewLedger({
+        job,
+        review,
+        ...(previousLedger === undefined ? {} : { previous: previousLedger }),
+        threads: threadState.threads,
+        threadContextComplete: threadState.complete,
+        ...(publishedReview?.id === undefined ? {} : { publishedReviewId: publishedReview.id }),
+      });
       if (!(await this.#commitOutcome(
         key,
         lease,
@@ -740,6 +794,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         budget.snapshot(),
         outcome.status === "completed" ? "Review complete" : "Review complete with limited evidence",
         signal,
+        ledger,
       ))) {
         return this.#finishWithoutOwnership(job, "outcome", checkRunId);
       }
@@ -833,6 +888,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     budget: ReviewBudgetSnapshot,
     progressTitle: string,
     signal: AbortSignal,
+    ledger?: ReviewLedger,
   ): Promise<boolean> {
     if (signal.aborted) return Promise.resolve(false);
     return this.#coordinator.transitionIfCurrent(
@@ -842,6 +898,9 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       checkRunId,
       async (transaction) => {
         await transaction.put(key, outcome);
+        if (ledger !== undefined) {
+          await transaction.put(REVIEW_LEDGER_STORAGE_KEY, ledger);
+        }
         const current = await transaction.get<StoredReviewSession>(REVIEW_SESSION_KEY);
         if (current?.runKey !== lease.runKey) return;
         await transaction.put<StoredReviewSession>(REVIEW_SESSION_KEY, {
@@ -954,16 +1013,35 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
     if (!(await this.#markSessionPhase(lease, "discovery", checkRunId))) {
       throw new Error("review superseded before discovery");
     }
-    const [changes, checks] = await Promise.all([
+    const previousLedger = await this.ctx.storage.get<ReviewLedger>(REVIEW_LEDGER_STORAGE_KEY);
+    const previousReviewedHeadSha = previousLedger?.lastHeadSha ?? job.beforeSha;
+    const [changes, checks, threadState, incrementalChanges] = await Promise.all([
       github.getPullChanges(job, signal),
       github.getOtherChecks(job, signal),
+      loadFindingThreads(github, job, signal),
+      previousReviewedHeadSha === undefined
+        ? Promise.resolve(undefined)
+        : loadIncrementalChanges(github, job, previousReviewedHeadSha, signal),
     ]);
+    const evolution: ReviewEvolutionContext = {
+      ...(previousReviewedHeadSha === undefined ? {} : { previousReviewedHeadSha }),
+      ...(incrementalChanges === undefined ? {} : { incrementalChanges }),
+      outstandingFindings: outstandingPriorFindings(previousLedger, threadState.threads),
+      threads: threadState.threads,
+      threadContextComplete: threadState.complete,
+    };
     using workspace = await getWorkspace(this);
     const repository = new RepositoryWorkspace(workspace, github, job, changes, { snapshot: true });
     await repository.initialize(checks, signal);
+    const impact = await buildChangeImpactMap(changes, repository, signal);
     logInfo("review.repository_snapshot", {
       ...reviewLogFields(job),
       ...repository.snapshotReport(),
+      riskLanes: impact.lanes.map((lane) => lane.id),
+      changedSymbols: impact.symbols.length,
+      impactSearchComplete: impact.searchComplete,
+      outstandingPriorFindings: evolution.outstandingFindings.length,
+      priorThreadContextComplete: evolution.threadContextComplete,
     });
     if (!(await this.#updateSession(lease, {
       artifactsReady: true,
@@ -1047,11 +1125,11 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
         const review = filterFindings(
           directDiscovery
             ? await agent.runDirectReview(
-                discoveryPrompt(job, changes, checks, policy, REVIEW_LENS),
+                discoveryPrompt(job, changes, checks, policy, REVIEW_LENS, { impact, evolution }),
                 "discovery",
               )
             : await agent.run(
-                discoveryPrompt(job, changes, checks, policy, REVIEW_LENS),
+                discoveryPrompt(job, changes, checks, policy, REVIEW_LENS, { impact, evolution }),
                 discoveryTools,
                 "discovery",
               ),
@@ -1077,9 +1155,75 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       cacheHitRate: repository.cacheSnapshot().hitRate,
       ...budget.snapshot(),
     });
-    const candidates = [discovery];
+    const maximumRiskLanes = booleanSetting(this.env.REVIEW_RISK_LANES, true)
+      ? Math.round(boundedNumber(this.env.REVIEW_MAX_RISK_LANES, 2, 0, 2))
+      : 0;
+    const riskLaneMaxOutputTokens = Math.round(boundedNumber(
+      this.env.REVIEW_RISK_LANE_MAX_OUTPUT_TOKENS,
+      16_000,
+      2_000,
+      32_000,
+    ));
+    const riskLanes = impact.lanes.slice(0, maximumRiskLanes);
+    const laneResults = await Promise.all(riskLanes.map(async (lane): Promise<DiscoveryResult | undefined> => {
+      const laneCheckpoint = lensCheckpointKey(job, `risk:${lane.id}`);
+      try {
+        const { value, cached: laneCached } = await withCheckpoint(
+          () => this.ctx.storage.get<DiscoveryResult>(laneCheckpoint),
+          (result) => this.ctx.storage.put(laneCheckpoint, result),
+          async () => {
+            const laneTools = new RepositoryTools(repository);
+            const laneAgent = new ReviewAgent({
+              ...agentOptions,
+              maxOutputTokensPerRequest: Math.min(maxOutputTokensPerRequest, riskLaneMaxOutputTokens),
+              maxExplorationTurns: 1,
+              requireInitialToolCall: false,
+            });
+            const laneChanges = changeSetForLane(changes, lane);
+            const review = filterFindings(
+              await laneAgent.run(
+                discoveryPrompt(job, laneChanges, checks, policy, REVIEW_LENS, {
+                  impact,
+                  evolution,
+                  lane,
+                }),
+                laneTools,
+                `discovery-risk-${lane.id}`,
+              ),
+              changedLines,
+              0,
+              12,
+            );
+            return { source: `risk:${lane.id}`, review, coverage: laneTools.coverage() };
+          },
+        );
+        logInfo("review.risk_lane_completed", {
+          ...reviewLogFields(job),
+          lane: lane.id,
+          cached: laneCached,
+          findings: value.review.findings.length,
+        });
+        return value;
+      } catch (error) {
+        signal.throwIfAborted();
+        if (isReviewBudgetExceededError(error)) throw error;
+        logError("review.risk_lane_failed", {
+          ...reviewLogFields(job),
+          lane: lane.id,
+          error: errorMessage(error),
+        });
+        return undefined;
+      }
+    }));
+    const candidates = [
+      discovery,
+      ...laneResults.filter((result): result is DiscoveryResult => result !== undefined),
+    ];
+    const discoveryCoverage = candidates
+      .map((candidate) => candidate.coverage)
+      .reduce(mergeEvidenceCoverage);
     if (candidates.every(({ review }) => review.findings.length === 0)) {
-      const coverage = discovery.coverage;
+      const coverage = discoveryCoverage;
       const review = {
         summary: !coverage.sufficient
           ? "No actionable bugs were proved, but the evidence coverage was incomplete; this is not a clean-review assertion."
@@ -1120,7 +1264,7 @@ export class Reviewer extends withWorkspace(ReviewerBase, workspaceOptions) {
       policy,
       signal,
       changedLines,
-      discoveryCoverage: discovery.coverage,
+      discoveryCoverage,
       configuredBaseThreshold: this.env.REVIEW_MIN_CONFIDENCE,
       configuredIncompleteEvidenceFloor: this.env.REVIEW_INCOMPLETE_EVIDENCE_MIN_CONFIDENCE,
       maxFindings,
@@ -1224,6 +1368,50 @@ function booleanSetting(value: string | undefined, fallback: boolean): boolean {
   if (value.trim().toLowerCase() === "true") return true;
   if (value.trim().toLowerCase() === "false") return false;
   return fallback;
+}
+
+async function loadFindingThreads(
+  github: GitHubClient,
+  job: ReviewJob,
+  signal: AbortSignal,
+): Promise<{ threads: FindingThread[]; complete: boolean }> {
+  try {
+    return { threads: await github.listFindingThreads(job, signal), complete: true };
+  } catch (error) {
+    signal.throwIfAborted();
+    logError("review.finding_threads_failed", {
+      ...reviewLogFields(job),
+      error: errorMessage(error),
+    });
+    return { threads: [], complete: false };
+  }
+}
+
+async function loadIncrementalChanges(
+  github: GitHubClient,
+  job: ReviewJob,
+  previousHeadSha: string,
+  signal: AbortSignal,
+) {
+  try {
+    return await github.getIncrementalChanges(job, previousHeadSha, signal);
+  } catch (error) {
+    signal.throwIfAborted();
+    logError("review.incremental_changes_failed", {
+      ...reviewLogFields(job),
+      previousHeadSha,
+      error: errorMessage(error),
+    });
+    return undefined;
+  }
+}
+
+function addCoverageLimitation(coverage: EvidenceCoverage, limitation: string): EvidenceCoverage {
+  return {
+    ...coverage,
+    sufficient: false,
+    limitations: [...new Set([...coverage.limitations, limitation])].slice(0, 20),
+  };
 }
 
 function reviewBudgetLimits(env: Env) {

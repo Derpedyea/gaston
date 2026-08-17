@@ -163,8 +163,8 @@ bunx wrangler tail gaston-pr-reviewer --format pretty
 In GitHub, verify:
 
 1. The App's **Advanced** page shows a successful `pull_request` webhook.
-2. The PR gets a `Gaston review` check.
-3. A clean review completes successfully without a comment.
+2. The PR gets a `Gaston review` run-health check and a `Gaston verdict` check.
+3. A clean, complete review makes both checks successful without a comment.
 4. High-confidence findings appear on changed lines and in one persistent
    summary comment.
 5. Pushing another commit cancels stale in-flight work and reviews the full
@@ -282,5 +282,8 @@ skips unless `GASTON_HISTORICAL_CORPUS` is set—and deterministic provider/tool
 protocol replays. Those scripted precision/recall
 numbers are regression-fixture checks, not evidence of live model quality; use
 hidden exact-SHA snapshots with semantic or executable adjudication for quality
-comparisons. A clean GitHub check is emitted only when the evidence ledger is
-complete; infrastructure or truncation hazards end neutral with coverage details.
+comparisons. Require `Gaston verdict`, rather than the run-health check, in a
+branch protection rule when Gaston should gate merges. The verdict is green only
+when cumulative evidence and prior-thread reconciliation are complete and no
+verified finding remains open; infrastructure or truncation hazards end neutral
+with coverage details.

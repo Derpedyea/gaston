@@ -3,7 +3,7 @@
   "name": "gaston-pr-reviewer",
   "main": "src/index.ts",
   "compatibility_date": "2026-08-10",
-  "compatibility_flags": ["nodejs_compat", "experimental"],
+  "compatibility_flags": ["nodejs_compat"],
 
   "worker_loaders": [{ "binding": "LOADER" }],
 
@@ -49,13 +49,17 @@
     "REVIEW_DIRECT_DISCOVERY": "false",
     "REVIEW_REQUIRE_INITIAL_TOOL_CALL": "false",
     "REVIEW_MAX_EXPLORATION_TURNS": "2",
+    "REVIEW_RISK_LANES": "true",
+    "REVIEW_MAX_RISK_LANES": "2",
+    "REVIEW_RISK_LANE_MAX_OUTPUT_TOKENS": "16000",
+    "REVIEW_VERDICT_CHECK": "true",
     "REVIEW_MAX_WALL_TIME_MS": "840000",
     "REVIEW_MODEL_TIMEOUT_MS": "660000",
     "REVIEW_MAX_MODEL_REQUESTS": "15",
     "REVIEW_MAX_INPUT_TOKENS": "250000",
     "REVIEW_MAX_OUTPUT_TOKENS": "128000",
     "REVIEW_MAX_COST_USD": "0.20",
-    "REVIEWER_GENERATION": "18"
+    "REVIEWER_GENERATION": "19"
   },
 
   "observability": {
